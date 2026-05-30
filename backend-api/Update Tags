@@ -1,0 +1,125 @@
+import json
+import boto3
+from decimal import Decimal
+
+dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table("AussieEcoLensMedia")
+
+def decimal_default(obj):
+    if isinstance(obj, Decimal):
+        return int(obj)
+    raise TypeError
+
+def lambda_handler(event, context):
+    print("Received event:")
+    print(json.dumps(event, indent=2))
+
+    try:
+        if "body" in event and event["body"]:
+            body = json.loads(event["body"])
+        else:
+            body = event
+
+        urls = body.get("urls", [])
+        tags_to_modify = body.get("tags", {})
+        operation = body.get("operation")
+
+        if not urls or not tags_to_modify or operation not in [0, 1]:
+            return {
+                "statusCode": 400,
+                "headers": {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*"
+                },
+                "body": json.dumps({
+                    "message": "Invalid request. Required format: {'urls': [...], 'tags': {'tag_name': count}, 'operation': 1 or 0}"
+                })
+            }
+
+        updated_items = []
+        not_found = []
+
+        response = table.scan()
+        items = response.get("Items", [])
+
+        while "LastEvaluatedKey" in response:
+            response = table.scan(ExclusiveStartKey=response["LastEvaluatedKey"])
+            items.extend(response.get("Items", []))
+
+        for url in urls:
+            matched_item = None
+
+            for item in items:
+                if item.get("file_url") == url or item.get("thumbnail_url") == url:
+                    matched_item = item
+                    break
+
+            if not matched_item:
+                not_found.append(url)
+                continue
+
+            file_id = matched_item["file_id"]
+            current_tags = matched_item.get("tags", {})
+
+            if operation == 1:
+                # Add tags
+                for tag, count in tags_to_modify.items():
+                    current_tags[tag] = int(current_tags.get(tag, 0)) + int(count)
+
+            elif operation == 0:
+                # Remove tags
+                for tag, count in tags_to_modify.items():
+                    if tag in current_tags:
+                        new_count = int(current_tags.get(tag, 0)) - int(count)
+
+                        if new_count > 0:
+                            current_tags[tag] = new_count
+                        else:
+                            del current_tags[tag]
+                    # If tag does not exist, ignore it as required
+
+            table.update_item(
+                Key={"file_id": file_id},
+                UpdateExpression="SET tags = :tags",
+                ExpressionAttributeValues={
+                    ":tags": current_tags
+                }
+            )
+
+            updated_items.append({
+                "file_id": file_id,
+                "file_name": matched_item.get("file_name"),
+                "file_url": matched_item.get("file_url"),
+                "thumbnail_url": matched_item.get("thumbnail_url"),
+                "updated_tags": current_tags
+            })
+
+        return {
+            "statusCode": 200,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*"
+            },
+            "body": json.dumps({
+                "message": "Tags updated successfully",
+                "operation": operation,
+                "updated_count": len(updated_items),
+                "updated_items": updated_items,
+                "not_found": not_found
+            }, default=decimal_default)
+        }
+
+    except Exception as e:
+        print("Error:", str(e))
+
+        return {
+            "statusCode": 500,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*"
+            },
+            "body": json.dumps({
+                "message": "Tag update failed",
+                "error": str(e)
+            })
+        }
