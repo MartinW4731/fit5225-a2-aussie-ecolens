@@ -1,0 +1,103 @@
+import json
+import boto3
+from decimal import Decimal
+
+dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table("AussieEcoLensMedia")
+
+def decimal_default(obj):
+    if isinstance(obj, Decimal):
+        return int(obj)
+    raise TypeError
+
+def lambda_handler(event, context):
+    print("Received event:")
+    print(json.dumps(event, indent=2))
+
+    try:
+        # API Gateway sometimes sends body as a string
+        if "body" in event and event["body"]:
+            body = json.loads(event["body"])
+        else:
+            body = event
+
+        # Expected format:
+        # {
+        #   "tags": {
+        #     "casuarius": 1
+        #   }
+        # }
+        required_tags = body.get("tags", {})
+
+        if not required_tags:
+            return {
+                "statusCode": 400,
+                "headers": {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*"
+                },
+                "body": json.dumps({
+                    "message": "Missing tags. Please provide tags in this format: {'tags': {'Casuarius_casuarius': 1}}"
+                })
+            }
+
+        response = table.scan()
+        items = response.get("Items", [])
+
+        # Continue scanning if DynamoDB paginates results
+        while "LastEvaluatedKey" in response:
+            response = table.scan(ExclusiveStartKey=response["LastEvaluatedKey"])
+            items.extend(response.get("Items", []))
+
+        matched_results = []
+
+        for item in items:
+            item_tags = item.get("tags", {})
+
+            matched = True
+
+            # Logical AND:
+            # every requested tag must exist and meet the minimum count
+            for tag, required_count in required_tags.items():
+                actual_count = int(item_tags.get(tag, 0))
+                if actual_count < int(required_count):
+                    matched = False
+                    break
+
+            if matched:
+                matched_results.append({
+                    "file_id": item.get("file_id"),
+                    "file_name": item.get("file_name"),
+                    "file_type": item.get("file_type"),
+                    "file_url": item.get("file_url"),
+                    "thumbnail_url": item.get("thumbnail_url"),
+                    "tags": item_tags
+                })
+
+        return {
+            "statusCode": 200,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*"
+            },
+            "body": json.dumps({
+                "query": required_tags,
+                "count": len(matched_results),
+                "results": matched_results
+            }, default=decimal_default)
+        }
+
+    except Exception as e:
+        print("Error:", str(e))
+
+        return {
+            "statusCode": 500,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*"
+            },
+            "body": json.dumps({
+                "message": "Search failed",
+                "error": str(e)
+            })
+        }
