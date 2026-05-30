@@ -1,0 +1,86 @@
+import json
+import boto3
+from decimal import Decimal
+
+dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table("AussieEcoLensMedia")
+
+def decimal_default(obj):
+    if isinstance(obj, Decimal):
+        return int(obj)
+    raise TypeError
+
+def lambda_handler(event, context):
+    print("Received event:")
+    print(json.dumps(event, indent=2))
+
+    try:
+        if "body" in event and event["body"]:
+            body = json.loads(event["body"])
+        else:
+            body = event
+
+        thumbnail_url = body.get("thumbnail_url")
+
+        if not thumbnail_url:
+            return {
+                "statusCode": 400,
+                "headers": {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*"
+                },
+                "body": json.dumps({
+                    "message": "Missing thumbnail_url. Please provide {'thumbnail_url': 's3://.../thumbnails/example.JPG'}"
+                })
+            }
+
+        response = table.scan()
+        items = response.get("Items", [])
+
+        while "LastEvaluatedKey" in response:
+            response = table.scan(ExclusiveStartKey=response["LastEvaluatedKey"])
+            items.extend(response.get("Items", []))
+
+        for item in items:
+            if item.get("thumbnail_url") == thumbnail_url:
+                return {
+                    "statusCode": 200,
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "Access-Control-Allow-Origin": "*"
+                    },
+                    "body": json.dumps({
+                        "thumbnail_url": thumbnail_url,
+                        "file_url": item.get("file_url"),
+                        "file_name": item.get("file_name"),
+                        "file_type": item.get("file_type"),
+                        "tags": item.get("tags", {})
+                    }, default=decimal_default)
+                }
+
+        return {
+            "statusCode": 404,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*"
+            },
+            "body": json.dumps({
+                "message": "No image found for this thumbnail_url",
+                "thumbnail_url": thumbnail_url
+            })
+        }
+
+    except Exception as e:
+        print("Error:", str(e))
+
+        return {
+            "statusCode": 500,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*"
+            },
+            "body": json.dumps({
+                "message": "Query failed",
+                "error": str(e)
+            })
+        }
