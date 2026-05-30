@@ -1,26 +1,44 @@
 import json
+import os
 import boto3
 from decimal import Decimal
 
 dynamodb = boto3.resource("dynamodb")
-table = dynamodb.Table("AussieEcoLensMedia")
+table = dynamodb.Table(os.environ.get("TABLE_NAME", "AussieEcoLensMedia"))
 
 def decimal_default(obj):
+    """Convert DynamoDB Decimal values into JSON-safe Python numbers."""
     if isinstance(obj, Decimal):
-        return int(obj)
+        # Preserve integer-looking values as int, but keep fractional values as float.
+        if obj % 1 == 0:
+            return int(obj)
+        return float(obj)
     raise TypeError
+
+def get_thumbnail_url(body):
+    """Read the thumbnail value from any supported request field alias."""
+    return (
+        body.get("thumbnail_url")
+        or body.get("thumbnailUrl")
+        or body.get("thumbnail")
+    )
 
 def lambda_handler(event, context):
     print("Received event:")
     print(json.dumps(event, indent=2))
 
     try:
+        # API Gateway usually sends request JSON inside body as a string.
         if "body" in event and event["body"]:
             body = json.loads(event["body"])
         else:
             body = event
 
-        thumbnail_url = body.get("thumbnail_url")
+        # Supported request aliases:
+        # {"thumbnail_url": "..."}
+        # {"thumbnailUrl": "..."}
+        # {"thumbnail": "..."}
+        thumbnail_url = get_thumbnail_url(body)
 
         if not thumbnail_url:
             return {
@@ -37,6 +55,7 @@ def lambda_handler(event, context):
         response = table.scan()
         items = response.get("Items", [])
 
+        # Continue scanning until all DynamoDB pages have been read.
         while "LastEvaluatedKey" in response:
             response = table.scan(ExclusiveStartKey=response["LastEvaluatedKey"])
             items.extend(response.get("Items", []))
@@ -51,6 +70,7 @@ def lambda_handler(event, context):
                     },
                     "body": json.dumps({
                         "thumbnail_url": thumbnail_url,
+                        # Return the matching full-size image URL.
                         "file_url": item.get("file_url"),
                         "file_name": item.get("file_name"),
                         "file_type": item.get("file_type"),

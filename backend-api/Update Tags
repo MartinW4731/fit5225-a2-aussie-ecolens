@@ -1,27 +1,49 @@
 import json
+import os
 import boto3
 from decimal import Decimal
 
 dynamodb = boto3.resource("dynamodb")
-table = dynamodb.Table("AussieEcoLensMedia")
+table = dynamodb.Table(os.environ.get("TABLE_NAME", "AussieEcoLensMedia"))
 
 def decimal_default(obj):
+    """Convert DynamoDB Decimal values into JSON-safe Python numbers."""
     if isinstance(obj, Decimal):
-        return int(obj)
+        # Preserve integer-looking values as int, but keep fractional values as float.
+        if obj % 1 == 0:
+            return int(obj)
+        return float(obj)
     raise TypeError
+
+def normalize_urls(urls):
+    """Accept one URL or a list of URLs, then process everything as a list."""
+    if isinstance(urls, str):
+        return [urls]
+    return urls or []
+
+def normalize_tags(tags):
+    """Return tags plus whether the caller sent a list or a count dictionary."""
+    if isinstance(tags, list):
+        return tags, "list"
+    if isinstance(tags, dict):
+        return tags, "dict"
+    return None, None
 
 def lambda_handler(event, context):
     print("Received event:")
     print(json.dumps(event, indent=2))
 
     try:
+        # API Gateway usually sends request JSON inside body as a string.
         if "body" in event and event["body"]:
             body = json.loads(event["body"])
         else:
             body = event
 
-        urls = body.get("urls", [])
-        tags_to_modify = body.get("tags", {})
+        # Bulk updates are performed by matching each supplied URL against
+        # either file_url or thumbnail_url in DynamoDB.
+        urls = normalize_urls(body.get("urls", []))
+        tags_to_modify, tags_format = normalize_tags(body.get("tags", {}))
         operation = body.get("operation")
 
         if not urls or not tags_to_modify or operation not in [0, 1]:
@@ -42,6 +64,7 @@ def lambda_handler(event, context):
         response = table.scan()
         items = response.get("Items", [])
 
+        # Continue scanning until all DynamoDB pages have been read.
         while "LastEvaluatedKey" in response:
             response = table.scan(ExclusiveStartKey=response["LastEvaluatedKey"])
             items.extend(response.get("Items", []))
@@ -62,21 +85,35 @@ def lambda_handler(event, context):
             current_tags = matched_item.get("tags", {})
 
             if operation == 1:
-                # Add tags
-                for tag, count in tags_to_modify.items():
-                    current_tags[tag] = int(current_tags.get(tag, 0)) + int(count)
+                # operation = 1 means add tags.
+                # List format adds each tag with count +1.
+                if tags_format == "list":
+                    for tag in tags_to_modify:
+                        current_tags[tag] = int(current_tags.get(tag, 0)) + 1
+
+                # Dictionary format adds the provided count for each tag.
+                elif tags_format == "dict":
+                    for tag, count in tags_to_modify.items():
+                        current_tags[tag] = int(current_tags.get(tag, 0)) + int(count)
 
             elif operation == 0:
-                # Remove tags
-                for tag, count in tags_to_modify.items():
-                    if tag in current_tags:
-                        new_count = int(current_tags.get(tag, 0)) - int(count)
+                # operation = 0 means remove tags.
+                # List format removes each tag completely. Missing tags are ignored.
+                if tags_format == "list":
+                    for tag in tags_to_modify:
+                        current_tags.pop(tag, None)
 
-                        if new_count > 0:
-                            current_tags[tag] = new_count
-                        else:
-                            del current_tags[tag]
-                    # If tag does not exist, ignore it as required
+                # Dictionary format subtracts the provided count, deleting the
+                # tag when its count reaches zero or below. Missing tags are ignored.
+                elif tags_format == "dict":
+                    for tag, count in tags_to_modify.items():
+                        if tag in current_tags:
+                            new_count = int(current_tags.get(tag, 0)) - int(count)
+
+                            if new_count > 0:
+                                current_tags[tag] = new_count
+                            else:
+                                del current_tags[tag]
 
             table.update_item(
                 Key={"file_id": file_id},
