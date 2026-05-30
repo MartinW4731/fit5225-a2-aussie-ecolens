@@ -1,0 +1,81 @@
+import json
+import os
+import boto3
+
+sns = boto3.client("sns")
+
+CORS_HEADERS = {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*"
+}
+
+def build_response(status_code, body):
+    """Return an API Gateway compatible JSON response with CORS headers."""
+    return {
+        "statusCode": status_code,
+        "headers": CORS_HEADERS,
+        "body": json.dumps(body)
+    }
+
+def lambda_handler(event, context):
+    print("Received event:")
+    print(json.dumps(event, indent=2))
+
+    try:
+        topic_arn = os.environ.get("SNS_TOPIC_ARN")
+
+        if not topic_arn:
+            return build_response(500, {
+                "message": "SNS_TOPIC_ARN environment variable is not configured"
+            })
+
+        # API Gateway usually sends request JSON inside body as a string.
+        if "body" in event and event["body"]:
+            body = json.loads(event["body"])
+        else:
+            body = event
+
+        email = body.get("email")
+        tag = body.get("tag")
+
+        if not email or not tag:
+            return build_response(400, {
+                "message": "Missing email or tag. Required format: {'email': 'student@example.com', 'tag': 'Koala'}"
+            })
+
+        # Subscribe the email address to the project SNS topic. The filter policy
+        # stores the requested tag so matching notifications can target this user.
+        response = sns.subscribe(
+            TopicArn=topic_arn,
+            Protocol="email",
+            Endpoint=email,
+            Attributes={
+                "FilterPolicy": json.dumps({
+                    "tag": [tag]
+                })
+            },
+            ReturnSubscriptionArn=True
+        )
+
+        return build_response(200, {
+            "message": "Subscription request sent",
+            "email": email,
+            "tag": tag,
+            "subscription_arn": response.get("SubscriptionArn")
+        })
+
+    except json.JSONDecodeError as e:
+        print("Invalid JSON:", str(e))
+
+        return build_response(400, {
+            "message": "Invalid JSON request body",
+            "error": str(e)
+        })
+
+    except Exception as e:
+        print("Error:", str(e))
+
+        return build_response(500, {
+            "message": "Subscription request failed",
+            "error": str(e)
+        })
