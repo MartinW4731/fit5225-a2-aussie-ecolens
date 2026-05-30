@@ -1,0 +1,153 @@
+import json
+import boto3
+from decimal import Decimal
+from urllib.parse import urlparse
+
+s3 = boto3.client("s3")
+dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table("AussieEcoLensMedia")
+
+def decimal_default(obj):
+    if isinstance(obj, Decimal):
+        return int(obj)
+    raise TypeError
+
+def parse_s3_url(s3_url):
+    # Expected format: s3://bucket-name/key
+    if not s3_url or not s3_url.startswith("s3://"):
+        return None, None
+
+    without_scheme = s3_url.replace("s3://", "", 1)
+    parts = without_scheme.split("/", 1)
+
+    if len(parts) != 2:
+        return None, None
+
+    bucket = parts[0]
+    key = parts[1]
+
+    return bucket, key
+
+def lambda_handler(event, context):
+    print("Received event:")
+    print(json.dumps(event, indent=2))
+
+    try:
+        if "body" in event and event["body"]:
+            body = json.loads(event["body"])
+        else:
+            body = event
+
+        urls = body.get("urls", [])
+
+        if not urls:
+            return {
+                "statusCode": 400,
+                "headers": {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*"
+                },
+                "body": json.dumps({
+                    "message": "Missing urls. Required format: {'urls': ['s3://bucket/uploads/example.JPG']}"
+                })
+            }
+
+        response = table.scan()
+        items = response.get("Items", [])
+
+        while "LastEvaluatedKey" in response:
+            response = table.scan(ExclusiveStartKey=response["LastEvaluatedKey"])
+            items.extend(response.get("Items", []))
+
+        deleted_items = []
+        not_found = []
+        errors = []
+
+        for url in urls:
+            matched_item = None
+
+            for item in items:
+                if item.get("file_url") == url or item.get("thumbnail_url") == url:
+                    matched_item = item
+                    break
+
+            if not matched_item:
+                not_found.append(url)
+                continue
+
+            file_id = matched_item["file_id"]
+            file_url = matched_item.get("file_url", "")
+            thumbnail_url = matched_item.get("thumbnail_url", "")
+
+            urls_to_delete = []
+
+            if file_url:
+                urls_to_delete.append(file_url)
+
+            if thumbnail_url:
+                urls_to_delete.append(thumbnail_url)
+
+            deleted_s3_objects = []
+
+            for s3_url in urls_to_delete:
+                bucket, key = parse_s3_url(s3_url)
+
+                if not bucket or not key:
+                    errors.append({
+                        "url": s3_url,
+                        "error": "Invalid S3 URL format"
+                    })
+                    continue
+
+                try:
+                    s3.delete_object(Bucket=bucket, Key=key)
+                    deleted_s3_objects.append(s3_url)
+                    print(f"Deleted from S3: {s3_url}")
+                except Exception as s3_error:
+                    errors.append({
+                        "url": s3_url,
+                        "error": str(s3_error)
+                    })
+
+            table.delete_item(
+                Key={"file_id": file_id}
+            )
+
+            print(f"Deleted DynamoDB item: {file_id}")
+
+            deleted_items.append({
+                "file_id": file_id,
+                "file_name": matched_item.get("file_name"),
+                "deleted_s3_objects": deleted_s3_objects,
+                "deleted_from_dynamodb": True
+            })
+
+        return {
+            "statusCode": 200,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*"
+            },
+            "body": json.dumps({
+                "message": "Delete operation completed",
+                "deleted_count": len(deleted_items),
+                "deleted_items": deleted_items,
+                "not_found": not_found,
+                "errors": errors
+            }, default=decimal_default)
+        }
+
+    except Exception as e:
+        print("Error:", str(e))
+
+        return {
+            "statusCode": 500,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*"
+            },
+            "body": json.dumps({
+                "message": "Delete operation failed",
+                "error": str(e)
+            })
+        }
