@@ -1,44 +1,93 @@
 import json
+import os
 import boto3
 from decimal import Decimal
 from urllib.parse import urlparse
 
 s3 = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
-table = dynamodb.Table("AussieEcoLensMedia")
+table = dynamodb.Table(os.environ.get("TABLE_NAME", "AussieEcoLensMedia"))
 
 def decimal_default(obj):
+    """Convert DynamoDB Decimal values into JSON-safe Python numbers."""
     if isinstance(obj, Decimal):
-        return int(obj)
+        # Preserve integer-looking values as int, but keep fractional values as float.
+        if obj % 1 == 0:
+            return int(obj)
+        return float(obj)
     raise TypeError
 
 def parse_s3_url(s3_url):
-    # Expected format: s3://bucket-name/key
-    if not s3_url or not s3_url.startswith("s3://"):
+    """Parse supported S3 URL formats into bucket and key."""
+    if not s3_url:
         return None, None
 
-    without_scheme = s3_url.replace("s3://", "", 1)
-    parts = without_scheme.split("/", 1)
+    if s3_url.startswith("s3://"):
+        # Format: s3://bucket-name/key
+        without_scheme = s3_url.replace("s3://", "", 1)
+        parts = without_scheme.split("/", 1)
 
-    if len(parts) != 2:
-        return None, None
+        if len(parts) != 2:
+            return None, None
 
-    bucket = parts[0]
-    key = parts[1]
+        bucket = parts[0]
+        key = parts[1]
 
-    return bucket, key
+        return bucket, key
+
+    parsed = urlparse(s3_url)
+
+    if parsed.scheme == "https" and parsed.netloc.endswith(".s3.amazonaws.com"):
+        # Format: https://bucket.s3.amazonaws.com/key
+        bucket = parsed.netloc.replace(".s3.amazonaws.com", "", 1)
+        key = parsed.path.lstrip("/")
+
+        if not bucket or not key:
+            return None, None
+
+        return bucket, key
+
+    return None, None
+
+def normalize_urls(urls):
+    """Accept one URL or a list of URLs, then process everything as a list."""
+    if isinstance(urls, str):
+        return [urls]
+    return urls or []
+
+def item_matches_url(item, url):
+    """Match the requested URL against every searchable media URL field."""
+    return (
+        item.get("file_url") == url
+        or item.get("thumbnail_url") == url
+        or item.get("video_url") == url
+    )
+
+def get_related_storage_urls(item):
+    """Return all cloud storage objects related to the matched media record."""
+    urls_to_delete = []
+
+    for field_name in ["file_url", "thumbnail_url", "video_url"]:
+        url = item.get(field_name)
+        if url:
+            urls_to_delete.append(url)
+
+    return urls_to_delete
 
 def lambda_handler(event, context):
     print("Received event:")
     print(json.dumps(event, indent=2))
 
     try:
+        # API Gateway usually sends request JSON inside body as a string.
         if "body" in event and event["body"]:
             body = json.loads(event["body"])
         else:
             body = event
 
-        urls = body.get("urls", [])
+        # Bulk deletion: each requested URL can point to a full image, thumbnail,
+        # or video object, and the whole matching DynamoDB item will be deleted.
+        urls = normalize_urls(body.get("urls", []))
 
         if not urls:
             return {
@@ -55,6 +104,7 @@ def lambda_handler(event, context):
         response = table.scan()
         items = response.get("Items", [])
 
+        # Continue scanning until all DynamoDB pages have been read.
         while "LastEvaluatedKey" in response:
             response = table.scan(ExclusiveStartKey=response["LastEvaluatedKey"])
             items.extend(response.get("Items", []))
@@ -67,7 +117,7 @@ def lambda_handler(event, context):
             matched_item = None
 
             for item in items:
-                if item.get("file_url") == url or item.get("thumbnail_url") == url:
+                if item_matches_url(item, url):
                     matched_item = item
                     break
 
@@ -76,19 +126,12 @@ def lambda_handler(event, context):
                 continue
 
             file_id = matched_item["file_id"]
-            file_url = matched_item.get("file_url", "")
-            thumbnail_url = matched_item.get("thumbnail_url", "")
-
-            urls_to_delete = []
-
-            if file_url:
-                urls_to_delete.append(file_url)
-
-            if thumbnail_url:
-                urls_to_delete.append(thumbnail_url)
+            urls_to_delete = get_related_storage_urls(matched_item)
 
             deleted_s3_objects = []
 
+            # Attempt every related S3 delete first. Individual failures are
+            # recorded, but do not stop the rest of the cleanup.
             for s3_url in urls_to_delete:
                 bucket, key = parse_s3_url(s3_url)
 
@@ -109,6 +152,8 @@ def lambda_handler(event, context):
                         "error": str(s3_error)
                     })
 
+            # Delete the DynamoDB record only after all related storage object
+            # deletions have been attempted.
             table.delete_item(
                 Key={"file_id": file_id}
             )
