@@ -1,14 +1,30 @@
 import json
+import os
 import boto3
 from decimal import Decimal
 
 dynamodb = boto3.resource("dynamodb")
-table = dynamodb.Table("AussieEcoLensMedia")
+table = dynamodb.Table(os.environ.get("TABLE_NAME", "AussieEcoLensMedia"))
 
 def decimal_default(obj):
+    """Convert DynamoDB Decimal values into JSON-safe Python numbers."""
     if isinstance(obj, Decimal):
-        return int(obj)
+        # Preserve integer-looking values as int, but keep fractional values as float.
+        if obj % 1 == 0:
+            return int(obj)
+        return float(obj)
     raise TypeError
+
+def get_required_tags(body):
+    """Normalize supported request shapes into the existing tags query format."""
+    required_tags = body.get("tags", {})
+
+    # Backwards-compatible convenience query:
+    # {"species": "Koala"} means {"tags": {"Koala": 1}}.
+    if not required_tags and body.get("species"):
+        required_tags = {body["species"]: 1}
+
+    return required_tags
 
 def lambda_handler(event, context):
     print("Received event:")
@@ -21,13 +37,17 @@ def lambda_handler(event, context):
         else:
             body = event
 
-        # Expected format:
+        # Supported formats:
         # {
         #   "tags": {
         #     "casuarius": 1
         #   }
         # }
-        required_tags = body.get("tags", {})
+        # or:
+        # {
+        #   "species": "casuarius"
+        # }
+        required_tags = get_required_tags(body)
 
         if not required_tags:
             return {
@@ -44,7 +64,7 @@ def lambda_handler(event, context):
         response = table.scan()
         items = response.get("Items", [])
 
-        # Continue scanning if DynamoDB paginates results
+        # Continue scanning until all DynamoDB pages have been read.
         while "LastEvaluatedKey" in response:
             response = table.scan(ExclusiveStartKey=response["LastEvaluatedKey"])
             items.extend(response.get("Items", []))
@@ -57,7 +77,7 @@ def lambda_handler(event, context):
             matched = True
 
             # Logical AND:
-            # every requested tag must exist and meet the minimum count
+            # every requested tag must exist and meet the minimum count.
             for tag, required_count in required_tags.items():
                 actual_count = int(item_tags.get(tag, 0))
                 if actual_count < int(required_count):
