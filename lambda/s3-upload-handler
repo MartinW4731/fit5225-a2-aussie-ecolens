@@ -1,0 +1,169 @@
+import json
+import urllib.parse
+import boto3
+import uuid
+import hashlib
+import re
+from datetime import datetime, timezone
+from boto3.dynamodb.conditions import Attr
+from PIL import Image
+from io import BytesIO
+
+s3 = boto3.client("s3")
+dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table("AussieEcoLensMedia")
+
+def calculate_sha256(bucket_name, object_key):
+    response = s3.get_object(Bucket=bucket_name, Key=object_key)
+    file_bytes = response["Body"].read()
+    return hashlib.sha256(file_bytes).hexdigest()
+
+def create_thumbnail(bucket_name, object_key, file_name):
+    response = s3.get_object(Bucket=bucket_name, Key=object_key)
+    image_bytes = response["Body"].read()
+
+    image = Image.open(BytesIO(image_bytes))
+    image.thumbnail((200, 200))
+
+    thumb_buffer = BytesIO()
+
+    image_format = image.format if image.format else "JPEG"
+
+    if image_format.upper() in ["JPEG", "JPG"] and image.mode in ("RGBA", "P"):
+        image = image.convert("RGB")
+
+    image.save(thumb_buffer, format=image_format)
+    thumb_buffer.seek(0)
+
+    thumbnail_key = f"thumbnails/{file_name}"
+
+    content_type = response.get("ContentType", "image/jpeg")
+
+    s3.put_object(
+        Bucket=bucket_name,
+        Key=thumbnail_key,
+        Body=thumb_buffer,
+        ContentType=content_type
+    )
+
+    print(f"Thumbnail created: {thumbnail_key}")
+
+    return thumbnail_key
+
+def generate_basic_tags(file_name):
+    # Remove file extension
+    name_without_ext = file_name.rsplit(".", 1)[0].lower()
+
+    # Split by underscore, hyphen, space, or number
+    words = re.split(r"[_\-\s\d]+", name_without_ext)
+
+    # Remove empty words and very short meaningless words
+    words = [word for word in words if word and len(word) > 1]
+
+    tags = {}
+
+    for word in words:
+        tags[word] = tags.get(word, 0) + 1
+
+    # Optional general tags
+    tags["image"] = 1
+
+    return tags
+
+def lambda_handler(event, context):
+    print("Received event:")
+    print(json.dumps(event, indent=2))
+
+    results = []
+
+    for record in event.get("Records", []):
+        bucket_name = record["s3"]["bucket"]["name"]
+        object_key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
+
+        # Only process files inside uploads/
+        if not object_key.startswith("uploads/"):
+            print(f"Skipped non-upload object: {object_key}")
+            continue
+
+        file_name = object_key.split("/")[-1]
+        file_extension = file_name.split(".")[-1].lower() if "." in file_name else ""
+
+        if file_extension in ["jpg", "jpeg", "png"]:
+            file_type = "image"
+        elif file_extension in ["mp4", "mov", "avi"]:
+            file_type = "video"
+        else:
+            file_type = "unknown"
+
+        # Calculate checksum
+        checksum = calculate_sha256(bucket_name, object_key)
+        print(f"Checksum for {object_key}: {checksum}")
+
+        # Check if same checksum already exists in DynamoDB
+        duplicate_check = table.scan(
+            FilterExpression=Attr("checksum").eq(checksum)
+        )
+
+        existing_items = duplicate_check.get("Items", [])
+
+        if existing_items:
+            print("Duplicate file detected.")
+            print(json.dumps(existing_items, indent=2, default=str))
+
+            # Delete duplicate object from S3 to save storage
+            s3.delete_object(Bucket=bucket_name, Key=object_key)
+            print(f"Deleted duplicate object from S3: {object_key}")
+
+            results.append({
+                "file_name": file_name,
+                "status": "duplicate_deleted",
+                "checksum": checksum
+            })
+
+            continue
+
+        file_id = str(uuid.uuid4())
+
+        thumbnail_url = ""
+
+        if file_type == "image":
+            thumbnail_key = create_thumbnail(bucket_name, object_key, file_name)
+            thumbnail_url = f"s3://{bucket_name}/{thumbnail_key}"
+
+        tags = {}
+
+        if file_type == "image":
+            tags = generate_basic_tags(file_name)
+
+        item = {
+                "file_id": file_id,
+                "bucket": bucket_name,
+                "s3_key": object_key,
+                "file_name": file_name,
+                "file_type": file_type,
+                "file_url": f"s3://{bucket_name}/{object_key}",
+                "thumbnail_url": thumbnail_url,
+                "tags": tags,
+                "checksum": checksum,
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }
+
+        table.put_item(Item=item)
+
+        print("Inserted new item into DynamoDB:")
+        print(json.dumps(item, indent=2))
+
+        results.append({
+            "file_name": file_name,
+            "status": "inserted_with_thumbnail" if file_type == "image" else "inserted",
+            "checksum": checksum,
+            "thumbnail_url": thumbnail_url
+        })
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "message": "S3 upload event processed with checksum deduplication and thumbnail generation",
+            "results": results
+        })
+    }
