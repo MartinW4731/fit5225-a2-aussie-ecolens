@@ -4,6 +4,8 @@ import boto3
 import uuid
 import hashlib
 import re
+import base64
+import urllib.request
 from datetime import datetime, timezone
 from boto3.dynamodb.conditions import Attr
 from PIL import Image
@@ -12,6 +14,7 @@ from io import BytesIO
 s3 = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table("AussieEcoLensMedia")
+ORACLE_DETECT_URL = "http://161.33.88.163:8080/detect"
 
 def calculate_sha256(bucket_name, object_key):
     response = s3.get_object(Bucket=bucket_name, Key=object_key)
@@ -99,6 +102,9 @@ def lambda_handler(event, context):
         checksum = calculate_sha256(bucket_name, object_key)
         print(f"Checksum for {object_key}: {checksum}")
 
+        image_response = s3.get_object(Bucket=bucket_name, Key=object_key)
+        image_bytes = image_response["Body"].read()
+
         # Check if same checksum already exists in DynamoDB
         duplicate_check = table.scan(
             FilterExpression=Attr("checksum").eq(checksum)
@@ -133,7 +139,7 @@ def lambda_handler(event, context):
         tags = {}
 
         if file_type == "image":
-            tags = generate_basic_tags(file_name)
+            tags = call_oracle_species_detector(file_name, file_type, image_bytes)
 
         item = {
                 "file_id": file_id,
@@ -167,3 +173,41 @@ def lambda_handler(event, context):
             "results": results
         })
     }
+def call_oracle_species_detector(file_name, file_type, image_bytes):
+    image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    payload = {
+        "file_name": file_name,
+        "file_type": file_type,
+        "image_base64": image_base64
+    }
+
+    data = json.dumps(payload).encode("utf-8")
+
+    request = urllib.request.Request(
+        ORACLE_DETECT_URL,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response_body = response.read().decode("utf-8")
+            result = json.loads(response_body)
+
+        print("Oracle ML response:")
+        print(json.dumps(result, indent=2))
+
+        tags = result.get("tags", {})
+
+        if tags:
+            return tags
+
+        print("Oracle response did not include tags. Falling back to basic tags.")
+        return generate_basic_tags(file_name)
+
+    except Exception as e:
+        print(f"Oracle ML detection failed: {str(e)}")
+        print("Falling back to basic tags.")
+        return generate_basic_tags(file_name)
