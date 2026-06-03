@@ -6,6 +6,7 @@ from typing import Dict, List, Tuple
 import torch
 import torchvision.transforms as transforms
 import yaml
+import cv2
 from PIL import Image
 from megadetector.detection import run_detector_batch
 
@@ -175,6 +176,64 @@ def aggregate_predictions(predictions: List[Tuple[str, float]]) -> Tuple[Dict[st
         confidence[species] = max(confidence.get(species, 0.0), score)
 
     return tags, confidence
+
+
+def process_video_path(video_path: Path, pipeline: Dict) -> Tuple[Dict[str, int], Dict[str, float], int]:
+    if not video_path.exists():
+        raise ValueError("video file does not exist")
+
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        capture.release()
+        raise ValueError("video cannot be opened")
+
+    fps = capture.get(cv2.CAP_PROP_FPS) or 0.0
+    frame_interval = int(fps) if fps and fps > 0 else 1
+    if frame_interval < 1:
+        frame_interval = 1
+
+    frame_number = 0
+    processed_frames = 0
+    aggregate_tags: Dict[str, int] = {}
+    aggregate_confidence: Dict[str, float] = {}
+
+    try:
+        while True:
+            ret, frame = capture.read()
+            if not ret:
+                break
+
+            if frame_number % frame_interval == 0:
+                frame_path = Path(f"/tmp/frame_{processed_frames}.jpg")
+                image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                image.save(frame_path)
+                try:
+                    tags, confidence = process_image_path(frame_path, pipeline)
+                finally:
+                    try:
+                        if frame_path.exists():
+                            frame_path.unlink()
+                    except OSError:
+                        pass
+
+                if not (tags == {"no_animal_detected": 0} and confidence == {"no_animal_detected": 0.0}):
+                    for species, count in tags.items():
+                        aggregate_tags[species] = aggregate_tags.get(species, 0) + count
+                    for species, score in confidence.items():
+                        aggregate_confidence[species] = max(aggregate_confidence.get(species, 0.0), score)
+
+                processed_frames += 1
+
+            frame_number += 1
+    finally:
+        capture.release()
+
+    if processed_frames == 0:
+        return {"no_frame_processed": 0}, {"no_frame_processed": 0.0}, 0
+    if not aggregate_tags:
+        return {"no_animal_detected": 0}, {"no_animal_detected": 0.0}, processed_frames
+
+    return aggregate_tags, aggregate_confidence, processed_frames
 
 
 def process_image_path(image_path: Path, pipeline: Dict) -> Tuple[Dict[str, int], Dict[str, float]]:

@@ -8,4 +8,5 @@ megadetector
 PyYAML
 numpy
 tqdm
+opencv-python-headless
 matplotlib
