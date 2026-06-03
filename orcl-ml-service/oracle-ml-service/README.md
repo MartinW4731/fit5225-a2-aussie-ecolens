@@ -1,7 +1,7 @@
-# Oracle ML Service (Skeleton)
+# Oracle ML Service (Phase 2)
 
-This directory contains the Oracle skeleton ML service for FIT5225 Aussie EcoLens.
-It implements the first-phase Oracle endpoint that AWS Lambda can call for connectivity testing.
+This directory contains the Oracle ML API service for FIT5225 Aussie EcoLens.
+It now performs real inference using MegaDetector and a species classification model.
 
 ## API
 
@@ -32,7 +32,17 @@ Response JSON:
 {
   "tags": { "Casuarius_casuarius": 1 },
   "confidence": { "Casuarius_casuarius": 0.99 },
-  "source": "Oracle skeleton ML service"
+  "source": "Oracle ML detection"
+}
+```
+
+If no animals are detected, the service returns:
+
+```json
+{
+  "tags": { "no_animal_detected": 0 },
+  "confidence": { "no_animal_detected": 0.0 },
+  "source": "Oracle ML detection"
 }
 ```
 
@@ -60,7 +70,15 @@ docker run --rm -p 8080:8080 \
   oracle-ml-service:latest
 ```
 
+## Model files
+
+- `mdv5a.pt`: MegaDetector detector
+- `model.pt`: species classifier
+- `labels.txt`: class label mapping for `model.pt`
+- `config.yaml`: detection threshold and snip config used by the pipeline
+
 ## Notes
 
-- Stage 1 is a skeleton service. It returns fake tags based on the file name.
-- Stage 2 will replace the fake tag logic with real ML inference using `mdv5a.pt`, `model.pt`, and `labels.txt`.
+- The Flask app now loads models once at startup.
+- The `/detect` endpoint decodes `image_base64`, runs MegaDetector, crops animal boxes, classifies species, and returns counts + confidence.
+- If the model file paths are changed, update `ml_pipeline.py` or set up a wrapper to point to the new locations.

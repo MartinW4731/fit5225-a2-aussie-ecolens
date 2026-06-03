@@ -1,8 +1,12 @@
 from flask import Flask, request, jsonify
 import os
+from pathlib import Path
+
+from ml_pipeline import DEFAULT_SOURCE, decode_base64_image, load_models, process_image_path
 
 app = Flask(__name__)
 API_KEY = os.environ.get("ORACLE_API_KEY", "")
+PIPELINE = load_models()
 
 
 def check_api_key(req):
@@ -29,25 +33,30 @@ def detect_species():
     data = request.get_json(silent=True) or {}
     file_name = data.get("file_name", "")
     file_type = data.get("file_type", "image")
+    image_base64 = data.get("image_base64")
 
-    lower_name = file_name.lower()
-    if "casuarius" in lower_name:
-        tags = {"Casuarius_casuarius": 1}
-        confidence = {"Casuarius_casuarius": 0.99}
-    elif "bos" in lower_name or "taurus" in lower_name:
-        tags = {"Bos_taurus": 1}
-        confidence = {"Bos_taurus": 0.99}
-    elif "macropus" in lower_name:
-        tags = {"Macropus_giganteus": 1}
-        confidence = {"Macropus_giganteus": 0.99}
-    else:
-        tags = {"unknown_species": 1}
-        confidence = {"unknown_species": 0.50}
+    if not image_base64:
+        return jsonify({"message": "image_base64 is required"}), 400
+
+    temp_path = Path("/tmp/input.jpg")
+    try:
+        decode_base64_image(image_base64, temp_path)
+        tags, confidence = process_image_path(temp_path, PIPELINE)
+    except ValueError as exc:
+        return jsonify({"message": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"message": f"Inference failed: {exc}"}), 500
+    finally:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            pass
 
     return jsonify({
         "tags": tags,
         "confidence": confidence,
-        "source": "Oracle skeleton ML service"
+        "source": DEFAULT_SOURCE,
     })
 
 
