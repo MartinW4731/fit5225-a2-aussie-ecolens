@@ -38,14 +38,37 @@ function App() {
     return tagObject
   }
 
-  const fileToBase64 = (file) =>
+  const compressImageToBase64 = (file, maxWidth = 800, quality = 0.75) =>
     new Promise((resolve, reject) => {
       const reader = new FileReader()
 
-      reader.onload = () => {
-        const result = reader.result
-        const base64 = result.split(',')[1]
-        resolve(base64)
+      reader.onload = (event) => {
+        const img = new Image()
+
+        img.onload = () => {
+          const scale = Math.min(1, maxWidth / img.width)
+          const canvas = document.createElement('canvas')
+
+          canvas.width = Math.round(img.width * scale)
+          canvas.height = Math.round(img.height * scale)
+
+          const ctx = canvas.getContext('2d')
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+
+          const dataUrl = canvas.toDataURL('image/jpeg', quality)
+          const base64 = dataUrl.split(',')[1]
+
+          resolve({
+            base64,
+            originalSize: file.size,
+            compressedSize: Math.round((base64.length * 3) / 4),
+            width: canvas.width,
+            height: canvas.height
+          })
+        }
+
+        img.onerror = reject
+        img.src = event.target.result
       }
 
       reader.onerror = reject
@@ -132,24 +155,15 @@ function App() {
       return
     }
 
-    if (queryFile.size > 1000000) {
-      setResponse({
-        message:
-          'The query image is too large. Please use an image smaller than 1 MB for this demo.',
-        file_size_bytes: queryFile.size
-      })
-      return
-    }
-
     setLoading(true)
 
     try {
-      const imageBase64 = await fileToBase64(queryFile)
+      const compressedImage = await compressImageToBase64(queryFile)
 
       const payload = {
         file_name: queryFile.name,
         file_type: 'image',
-        image_base64: imageBase64
+        image_base64: compressedImage.base64
       }
 
       const res = await fetch(`${API_BASE_URL}/query/by-upload`, {
@@ -167,7 +181,11 @@ function App() {
         request: {
           file_name: queryFile.name,
           file_type: 'image',
-          image_base64: '[base64 hidden in UI]'
+          image_base64: '[compressed base64 hidden in UI]',
+          original_size_kb: Math.round(compressedImage.originalSize / 1024),
+          compressed_size_kb: Math.round(compressedImage.compressedSize / 1024),
+          compressed_width: compressedImage.width,
+          compressed_height: compressedImage.height
         },
         status: res.status,
         ...data
@@ -268,17 +286,35 @@ function App() {
     return (
       <div style={styles.detectedBox}>
         <h3 style={styles.cardTitle}>Detected Tags From Uploaded File</h3>
+
         <p>
           <strong>Source:</strong> {response.source || 'Oracle ML detection'}
         </p>
+
         <p>
-          <strong>Uploaded file:</strong> {response.uploaded_file_name || ''}
+          <strong>Uploaded file:</strong>{' '}
+          {response.uploaded_file_name || response.request?.file_name || ''}
+        </p>
+
+        {response.request?.original_size_kb && (
+          <p>
+            <strong>Image compression:</strong>{' '}
+            {response.request.original_size_kb} KB →{' '}
+            {response.request.compressed_size_kb} KB (
+            {response.request.compressed_width} ×{' '}
+            {response.request.compressed_height})
+          </p>
+        )}
+
+        <p>
+          <strong>Detected tags:</strong>
         </p>
         <pre style={styles.smallPre}>
           {JSON.stringify(response.detected_tags || {}, null, 2)}
         </pre>
+
         <p>
-          <strong>Confidence:</strong>
+          <strong>Detection confidence:</strong>
         </p>
         <pre style={styles.smallPre}>
           {JSON.stringify(response.confidence || {}, null, 2)}
@@ -301,7 +337,7 @@ function App() {
             <h3 style={styles.cardTitle}>{item.file_name || 'Result file'}</h3>
 
             <p>
-              <strong>Type:</strong> {item.file_type}
+              <strong>Type:</strong> {item.file_type || 'file'}
             </p>
 
             {item.file_type === 'image' && item.thumbnail_presigned_url && (
@@ -346,6 +382,12 @@ function App() {
               {JSON.stringify(item.confidence || {}, null, 2)}
             </pre>
 
+            {item.ml_source && (
+              <p>
+                <strong>ML source:</strong> {item.ml_source}
+              </p>
+            )}
+
             {item.file_type === 'video' && (
               <p>
                 <strong>Frames processed:</strong>{' '}
@@ -368,6 +410,7 @@ function App() {
       <div style={styles.grid}>
         <section style={styles.section}>
           <h2 style={styles.sectionTitle}>Search By Tags</h2>
+
           <label style={styles.label}>
             Tag name
             <input
@@ -377,6 +420,7 @@ function App() {
               placeholder="thylogale_stigmatica"
             />
           </label>
+
           <label style={styles.label}>
             Minimum count
             <input
@@ -387,6 +431,7 @@ function App() {
               onChange={(event) => setMinimumCount(event.target.value)}
             />
           </label>
+
           <button style={styles.button} type="button" onClick={handleSearchTags}>
             Search
           </button>
@@ -394,6 +439,7 @@ function App() {
 
         <section style={styles.section}>
           <h2 style={styles.sectionTitle}>Search By Species</h2>
+
           <label style={styles.label}>
             Species
             <input
@@ -403,6 +449,7 @@ function App() {
               placeholder="canis_familiaris"
             />
           </label>
+
           <button
             style={styles.button}
             type="button"
@@ -414,9 +461,11 @@ function App() {
 
         <section style={styles.section}>
           <h2 style={styles.sectionTitle}>Search By Uploaded File</h2>
+
           <p style={styles.helperText}>
-            Upload a small query image. The system detects its species tag using
-            Oracle ML, then searches matching media from DynamoDB.
+            Upload a query image. The frontend compresses it before sending it
+            to the search API. The system detects its species tag using Oracle
+            ML, then searches matching media from DynamoDB.
           </p>
 
           <label style={styles.label}>
@@ -446,6 +495,7 @@ function App() {
 
         <section style={styles.section}>
           <h2 style={styles.sectionTitle}>Get Image By Thumbnail</h2>
+
           <label style={styles.label}>
             Thumbnail URL
             <input
@@ -455,6 +505,7 @@ function App() {
               placeholder="s3://fit5225-a2-aussie-ecolens-media-group157/thumbnails/Thylogale_stigmatica_1.JPG"
             />
           </label>
+
           <button
             style={styles.button}
             type="button"
@@ -466,6 +517,7 @@ function App() {
 
         <section style={styles.section}>
           <h2 style={styles.sectionTitle}>Update Tags</h2>
+
           <label style={styles.label}>
             URLs
             <textarea
@@ -475,6 +527,7 @@ function App() {
               placeholder="s3://fit5225-a2-aussie-ecolens-media-group157/uploads/Thylogale_stigmatica_1.JPG"
             />
           </label>
+
           <label style={styles.label}>
             Tags
             <textarea
@@ -484,6 +537,7 @@ function App() {
               placeholder="manual_checked"
             />
           </label>
+
           <label style={styles.label}>
             Operation
             <select
@@ -495,6 +549,7 @@ function App() {
               <option>Remove</option>
             </select>
           </label>
+
           <button style={styles.button} type="button" onClick={handleUpdateTags}>
             Submit
           </button>
@@ -502,6 +557,7 @@ function App() {
 
         <section style={styles.section}>
           <h2 style={styles.sectionTitle}>Delete Files</h2>
+
           <label style={styles.label}>
             URLs
             <textarea
@@ -511,6 +567,7 @@ function App() {
               placeholder="Only use test files here. One URL per line."
             />
           </label>
+
           <button
             style={styles.dangerButton}
             type="button"
@@ -523,9 +580,12 @@ function App() {
 
       <section style={styles.responseSection}>
         <h2 style={styles.sectionTitle}>Response</h2>
+
         {loading && <p>Loading...</p>}
+
         {renderDetectedTags()}
         {renderResults()}
+
         <pre style={styles.pre}>{JSON.stringify(response, null, 2)}</pre>
       </section>
     </main>
