@@ -11,12 +11,13 @@ function App() {
   const [minimumCount, setMinimumCount] = useState(1)
   const [species, setSpecies] = useState('')
   const [thumbnailUrl, setThumbnailUrl] = useState('')
+  const [queryFile, setQueryFile] = useState(null)
+
   const [updateUrls, setUpdateUrls] = useState('')
   const [updateTags, setUpdateTags] = useState('')
   const [operation, setOperation] = useState('Add')
+
   const [deleteUrls, setDeleteUrls] = useState('')
-  const [email, setEmail] = useState('')
-  const [subscribeTag, setSubscribeTag] = useState('')
   const [response, setResponse] = useState(initialResponse)
   const [loading, setLoading] = useState(false)
 
@@ -36,6 +37,20 @@ function App() {
 
     return tagObject
   }
+
+  const fileToBase64 = (file) =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader()
+
+      reader.onload = () => {
+        const result = reader.result
+        const base64 = result.split(',')[1]
+        resolve(base64)
+      }
+
+      reader.onerror = reject
+      reader.readAsDataURL(file)
+    })
 
   const callApi = async (endpoint, payload) => {
     setLoading(true)
@@ -103,6 +118,71 @@ function App() {
     callApi('/query/by-tags', payload)
   }
 
+  const handleSearchByUploadedFile = async () => {
+    if (!queryFile) {
+      setResponse({ message: 'Please choose a query image first.' })
+      return
+    }
+
+    if (!queryFile.type.startsWith('image/')) {
+      setResponse({
+        message:
+          'Please choose an image file. Video query upload is not enabled in this UI demo.'
+      })
+      return
+    }
+
+    if (queryFile.size > 1000000) {
+      setResponse({
+        message:
+          'The query image is too large. Please use an image smaller than 1 MB for this demo.',
+        file_size_bytes: queryFile.size
+      })
+      return
+    }
+
+    setLoading(true)
+
+    try {
+      const imageBase64 = await fileToBase64(queryFile)
+
+      const payload = {
+        file_name: queryFile.name,
+        file_type: 'image',
+        image_base64: imageBase64
+      }
+
+      const res = await fetch(`${API_BASE_URL}/query/by-upload`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      })
+
+      const data = await res.json()
+
+      setResponse({
+        endpoint: '/query/by-upload',
+        request: {
+          file_name: queryFile.name,
+          file_type: 'image',
+          image_base64: '[base64 hidden in UI]'
+        },
+        status: res.status,
+        ...data
+      })
+    } catch (error) {
+      setResponse({
+        endpoint: '/query/by-upload',
+        message: 'Uploaded file search failed',
+        error: String(error)
+      })
+    } finally {
+      setLoading(false)
+    }
+  }
+
   const handleThumbnailLookup = () => {
     if (!thumbnailUrl.trim()) {
       setResponse({ message: 'Please enter a thumbnail URL.' })
@@ -154,28 +234,63 @@ function App() {
     callApi('/files/delete', payload)
   }
 
-  const handleSubscribe = () => {
-    setResponse({
-      endpoint: 'Subscribe Tag Notification',
-      message:
-        'SNS email notification is already configured in the backend. When uploaded media contains watched tags, AWS SNS automatically sends an email.',
-      current_backend_watched_tags: [
-        'canis_familiaris',
-        'chalcophaps_longirostris',
-        'thylogale_stigmatica',
-        'Casuarius_casuarius'
-      ],
-      note:
-        'This UI field is kept for demonstration only. A dynamic subscription API has not been implemented yet.',
-      input_email: email,
-      input_tag: subscribeTag
-    })
+  const normaliseResults = () => {
+    if (Array.isArray(response.results)) {
+      return response.results
+    }
+
+    if (response.file_url || response.file_presigned_url) {
+      return [
+        {
+          file_id: response.file_id || 'single-result',
+          file_name: response.file_name,
+          file_type: response.file_type,
+          file_url: response.file_url,
+          thumbnail_url: response.thumbnail_url,
+          file_presigned_url: response.file_presigned_url,
+          thumbnail_presigned_url: response.thumbnail_presigned_url,
+          tags: response.tags || {},
+          confidence: response.confidence || {},
+          frames_processed: response.frames_processed || 0,
+          ml_source: response.ml_source || ''
+        }
+      ]
+    }
+
+    return []
+  }
+
+  const renderDetectedTags = () => {
+    if (!response.detected_tags) {
+      return null
+    }
+
+    return (
+      <div style={styles.detectedBox}>
+        <h3 style={styles.cardTitle}>Detected Tags From Uploaded File</h3>
+        <p>
+          <strong>Source:</strong> {response.source || 'Oracle ML detection'}
+        </p>
+        <p>
+          <strong>Uploaded file:</strong> {response.uploaded_file_name || ''}
+        </p>
+        <pre style={styles.smallPre}>
+          {JSON.stringify(response.detected_tags || {}, null, 2)}
+        </pre>
+        <p>
+          <strong>Confidence:</strong>
+        </p>
+        <pre style={styles.smallPre}>
+          {JSON.stringify(response.confidence || {}, null, 2)}
+        </pre>
+      </div>
+    )
   }
 
   const renderResults = () => {
-    const results = response.results
+    const results = normaliseResults()
 
-    if (!Array.isArray(results) || results.length === 0) {
+    if (results.length === 0) {
       return null
     }
 
@@ -183,7 +298,7 @@ function App() {
       <div style={styles.resultsGrid}>
         {results.map((item, index) => (
           <div key={item.file_id || index} style={styles.card}>
-            <h3 style={styles.cardTitle}>{item.file_name}</h3>
+            <h3 style={styles.cardTitle}>{item.file_name || 'Result file'}</h3>
 
             <p>
               <strong>Type:</strong> {item.file_type}
@@ -231,9 +346,12 @@ function App() {
               {JSON.stringify(item.confidence || {}, null, 2)}
             </pre>
 
-            <p>
-              <strong>Frames processed:</strong> {item.frames_processed || 0}
-            </p>
+            {item.file_type === 'video' && (
+              <p>
+                <strong>Frames processed:</strong>{' '}
+                {item.frames_processed || 0}
+              </p>
+            )}
           </div>
         ))}
       </div>
@@ -291,6 +409,38 @@ function App() {
             onClick={handleSearchSpecies}
           >
             Search
+          </button>
+        </section>
+
+        <section style={styles.section}>
+          <h2 style={styles.sectionTitle}>Search By Uploaded File</h2>
+          <p style={styles.helperText}>
+            Upload a small query image. The system detects its species tag using
+            Oracle ML, then searches matching media from DynamoDB.
+          </p>
+
+          <label style={styles.label}>
+            Query image
+            <input
+              style={styles.input}
+              type="file"
+              accept="image/*"
+              onChange={(event) => setQueryFile(event.target.files[0])}
+            />
+          </label>
+
+          {queryFile && (
+            <p style={styles.helperText}>
+              Selected: {queryFile.name} ({Math.round(queryFile.size / 1024)} KB)
+            </p>
+          )}
+
+          <button
+            style={styles.button}
+            type="button"
+            onClick={handleSearchByUploadedFile}
+          >
+            Search Similar Media
           </button>
         </section>
 
@@ -369,37 +519,12 @@ function App() {
             Delete
           </button>
         </section>
-
-        <section style={styles.section}>
-          <h2 style={styles.sectionTitle}>Subscribe Tag Notification</h2>
-          <label style={styles.label}>
-            Email
-            <input
-              style={styles.input}
-              type="email"
-              value={email}
-              onChange={(event) => setEmail(event.target.value)}
-              placeholder="student@example.com"
-            />
-          </label>
-          <label style={styles.label}>
-            Tag
-            <input
-              style={styles.input}
-              value={subscribeTag}
-              onChange={(event) => setSubscribeTag(event.target.value)}
-              placeholder="canis_familiaris"
-            />
-          </label>
-          <button style={styles.button} type="button" onClick={handleSubscribe}>
-            Subscribe
-          </button>
-        </section>
       </div>
 
       <section style={styles.responseSection}>
         <h2 style={styles.sectionTitle}>Response</h2>
         {loading && <p>Loading...</p>}
+        {renderDetectedTags()}
         {renderResults()}
         <pre style={styles.pre}>{JSON.stringify(response, null, 2)}</pre>
       </section>
@@ -459,6 +584,12 @@ const styles = {
     gap: '6px',
     fontSize: '14px',
     fontWeight: 700
+  },
+  helperText: {
+    margin: 0,
+    color: '#5d6d66',
+    fontSize: '13px',
+    lineHeight: 1.5
   },
   input: {
     width: '100%',
@@ -525,6 +656,12 @@ const styles = {
     border: '1px solid #d7e1dc',
     borderRadius: '8px',
     background: '#f8fbf9'
+  },
+  detectedBox: {
+    padding: '14px',
+    border: '1px solid #c5d6ce',
+    borderRadius: '8px',
+    background: '#eef6f1'
   },
   cardTitle: {
     marginTop: 0
