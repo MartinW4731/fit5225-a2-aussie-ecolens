@@ -1,5 +1,7 @@
 import { useState } from 'react'
 
+const API_BASE_URL = 'https://qpl03337ra.execute-api.ap-southeast-2.amazonaws.com'
+
 const initialResponse = {
   message: 'No request submitted yet'
 }
@@ -16,6 +18,7 @@ function App() {
   const [email, setEmail] = useState('')
   const [subscribeTag, setSubscribeTag] = useState('')
   const [response, setResponse] = useState(initialResponse)
+  const [loading, setLoading] = useState(false)
 
   const splitLines = (value) =>
     value
@@ -23,131 +26,226 @@ function App() {
       .map((item) => item.trim())
       .filter(Boolean)
 
-  const handleSearchTags = () => {
-    setResponse({
-      endpoint: 'Search By Tags',
-      request: {
-        tags: {
-          [tagName || 'Koala']: Number(minimumCount) || 1
-        }
-      },
-      message: 'Fake search by tags response',
-      count: 1,
-      results: [
-        {
-          file_id: 'mock-file-001',
-          file_name: 'koala.jpg',
-          file_url: 's3://aussie-ecolens/uploads/koala.jpg',
-          thumbnail_url: 's3://aussie-ecolens/thumbnails/koala.jpg',
-          tags: {
-            [tagName || 'Koala']: Number(minimumCount) || 1
-          }
-        }
-      ]
+  const tagsToObject = (value) => {
+    const tags = splitLines(value)
+    const tagObject = {}
+
+    tags.forEach((tag) => {
+      tagObject[tag] = 1
     })
+
+    return tagObject
+  }
+
+  const callApi = async (endpoint, payload) => {
+    setLoading(true)
+
+    try {
+      const res = await fetch(`${API_BASE_URL}${endpoint}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      })
+
+      const data = await res.json()
+
+      setResponse({
+        endpoint,
+        request: payload,
+        status: res.status,
+        ...data
+      })
+    } catch (error) {
+      setResponse({
+        endpoint,
+        request: payload,
+        message: 'Request failed',
+        error: String(error)
+      })
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleSearchTags = () => {
+    const finalTag = tagName.trim()
+
+    if (!finalTag) {
+      setResponse({ message: 'Please enter a tag name.' })
+      return
+    }
+
+    const payload = {
+      tags: {
+        [finalTag]: Number(minimumCount) || 1
+      }
+    }
+
+    callApi('/query/by-tags', payload)
   }
 
   const handleSearchSpecies = () => {
-    setResponse({
-      endpoint: 'Search By Tags',
-      request: {
-        species: species || 'Koala'
-      },
-      message: 'Fake search by species response',
-      count: 1,
-      results: [
-        {
-          file_id: 'mock-file-002',
-          file_name: 'species-match.jpg',
-          file_url: 's3://aussie-ecolens/uploads/species-match.jpg',
-          thumbnail_url: 's3://aussie-ecolens/thumbnails/species-match.jpg',
-          tags: {
-            [species || 'Koala']: 1
-          }
-        }
-      ]
-    })
+    const finalSpecies = species.trim()
+
+    if (!finalSpecies) {
+      setResponse({ message: 'Please enter a species tag.' })
+      return
+    }
+
+    const payload = {
+      tags: {
+        [finalSpecies]: 1
+      }
+    }
+
+    callApi('/query/by-tags', payload)
   }
 
   const handleThumbnailLookup = () => {
-    setResponse({
-      endpoint: 'Get Image By Thumbnail',
-      request: {
-        thumbnail_url:
-          thumbnailUrl || 's3://aussie-ecolens/thumbnails/example.jpg'
-      },
-      message: 'Fake thumbnail lookup response',
-      thumbnail_url:
-        thumbnailUrl || 's3://aussie-ecolens/thumbnails/example.jpg',
-      file_url: 's3://aussie-ecolens/uploads/example.jpg',
-      file_name: 'example.jpg',
-      file_type: 'image/jpeg',
-      tags: {
-        Koala: 1
-      }
-    })
+    if (!thumbnailUrl.trim()) {
+      setResponse({ message: 'Please enter a thumbnail URL.' })
+      return
+    }
+
+    const payload = {
+      thumbnail_url: thumbnailUrl.trim()
+    }
+
+    callApi('/query/by-thumbnail', payload)
   }
 
   const handleUpdateTags = () => {
-    setResponse({
-      endpoint: 'Update Tags',
-      request: {
-        urls: splitLines(updateUrls),
-        tags: splitLines(updateTags),
-        operation: operation === 'Add' ? 1 : 0
-      },
-      message: 'Fake tag update response',
-      operation: operation === 'Add' ? 1 : 0,
-      updated_count: splitLines(updateUrls).length,
-      updated_items: splitLines(updateUrls).map((url, index) => ({
-        file_id: `mock-file-${index + 1}`,
-        file_name: `mock-file-${index + 1}.jpg`,
-        file_url: url,
-        thumbnail_url: url.includes('/thumbnails/') ? url : '',
-        updated_tags: Object.fromEntries(
-          splitLines(updateTags).map((tag) => [tag, 1])
-        )
-      })),
-      not_found: []
-    })
+    const urls = splitLines(updateUrls)
+    const tags = tagsToObject(updateTags)
+
+    if (urls.length === 0) {
+      setResponse({ message: 'Please enter at least one file URL.' })
+      return
+    }
+
+    if (Object.keys(tags).length === 0) {
+      setResponse({ message: 'Please enter at least one tag.' })
+      return
+    }
+
+    const payload = {
+      urls,
+      tags,
+      operation: operation === 'Add' ? 1 : 0
+    }
+
+    callApi('/tags/update', payload)
   }
 
   const handleDeleteFiles = () => {
-    setResponse({
-      endpoint: 'Delete Files',
-      request: {
-        urls: splitLines(deleteUrls)
-      },
-      message: 'Fake delete files response',
-      deleted_count: splitLines(deleteUrls).length,
-      deleted_items: splitLines(deleteUrls).map((url, index) => ({
-        file_id: `mock-file-${index + 1}`,
-        file_name: `mock-file-${index + 1}.jpg`,
-        deleted_s3_objects: [url],
-        deleted_from_dynamodb: true
-      })),
-      not_found: [],
-      errors: []
-    })
+    const urls = splitLines(deleteUrls)
+
+    if (urls.length === 0) {
+      setResponse({ message: 'Please enter at least one file URL.' })
+      return
+    }
+
+    const payload = {
+      urls
+    }
+
+    callApi('/files/delete', payload)
   }
 
   const handleSubscribe = () => {
     setResponse({
-      endpoint: 'Subscribe Tag',
-      request: {
-        email: email || 'student@example.com',
-        tag: subscribeTag || 'Koala'
-      },
-      message: 'Subscription request sent',
-      email: email || 'student@example.com',
-      tag: subscribeTag || 'Koala',
-      subscription_arn: 'pending confirmation'
+      endpoint: 'Subscribe Tag Notification',
+      message:
+        'SNS email notification is already configured in the backend. When uploaded media contains watched tags, AWS SNS automatically sends an email.',
+      current_backend_watched_tags: [
+        'canis_familiaris',
+        'chalcophaps_longirostris',
+        'thylogale_stigmatica',
+        'Casuarius_casuarius'
+      ],
+      note:
+        'This UI field is kept for demonstration only. A dynamic subscription API has not been implemented yet.',
+      input_email: email,
+      input_tag: subscribeTag
     })
+  }
+
+  const renderResults = () => {
+    const results = response.results
+
+    if (!Array.isArray(results) || results.length === 0) {
+      return null
+    }
+
+    return (
+      <div style={styles.resultsGrid}>
+        {results.map((item, index) => (
+          <div key={item.file_id || index} style={styles.card}>
+            <h3 style={styles.cardTitle}>{item.file_name}</h3>
+
+            <p>
+              <strong>Type:</strong> {item.file_type}
+            </p>
+
+            {item.file_type === 'image' && item.thumbnail_presigned_url && (
+              <img
+                src={item.thumbnail_presigned_url}
+                alt={item.file_name}
+                style={styles.thumbnail}
+              />
+            )}
+
+            {item.file_type === 'video' && (
+              <p style={styles.videoLabel}>Video file</p>
+            )}
+
+            {item.file_presigned_url && (
+              <a
+                href={item.file_presigned_url}
+                target="_blank"
+                rel="noreferrer"
+                style={styles.linkButton}
+              >
+                Open full {item.file_type || 'file'}
+              </a>
+            )}
+
+            <p>
+              <strong>S3 URL:</strong>
+            </p>
+            <pre style={styles.smallPre}>{item.file_url || ''}</pre>
+
+            <p>
+              <strong>Tags:</strong>
+            </p>
+            <pre style={styles.smallPre}>
+              {JSON.stringify(item.tags || {}, null, 2)}
+            </pre>
+
+            <p>
+              <strong>Confidence:</strong>
+            </p>
+            <pre style={styles.smallPre}>
+              {JSON.stringify(item.confidence || {}, null, 2)}
+            </pre>
+
+            <p>
+              <strong>Frames processed:</strong> {item.frames_processed || 0}
+            </p>
+          </div>
+        ))}
+      </div>
+    )
   }
 
   return (
     <main style={styles.page}>
       <h1 style={styles.title}>Aussie EcoLens</h1>
+      <p style={styles.subtitle}>
+        Multi-cloud wildlife media search and management demo
+      </p>
 
       <div style={styles.grid}>
         <section style={styles.section}>
@@ -158,7 +256,7 @@ function App() {
               style={styles.input}
               value={tagName}
               onChange={(event) => setTagName(event.target.value)}
-              placeholder="Koala"
+              placeholder="thylogale_stigmatica"
             />
           </label>
           <label style={styles.label}>
@@ -184,7 +282,7 @@ function App() {
               style={styles.input}
               value={species}
               onChange={(event) => setSpecies(event.target.value)}
-              placeholder="Koala"
+              placeholder="canis_familiaris"
             />
           </label>
           <button
@@ -204,7 +302,7 @@ function App() {
               style={styles.input}
               value={thumbnailUrl}
               onChange={(event) => setThumbnailUrl(event.target.value)}
-              placeholder="s3://bucket/thumbnails/example.jpg"
+              placeholder="s3://fit5225-a2-aussie-ecolens-media-group157/thumbnails/Thylogale_stigmatica_1.JPG"
             />
           </label>
           <button
@@ -224,7 +322,7 @@ function App() {
               style={styles.textarea}
               value={updateUrls}
               onChange={(event) => setUpdateUrls(event.target.value)}
-              placeholder="One URL per line"
+              placeholder="s3://fit5225-a2-aussie-ecolens-media-group157/uploads/Thylogale_stigmatica_1.JPG"
             />
           </label>
           <label style={styles.label}>
@@ -233,7 +331,7 @@ function App() {
               style={styles.textarea}
               value={updateTags}
               onChange={(event) => setUpdateTags(event.target.value)}
-              placeholder="One tag per line"
+              placeholder="manual_checked"
             />
           </label>
           <label style={styles.label}>
@@ -260,7 +358,7 @@ function App() {
               style={styles.textarea}
               value={deleteUrls}
               onChange={(event) => setDeleteUrls(event.target.value)}
-              placeholder="One URL per line"
+              placeholder="Only use test files here. One URL per line."
             />
           </label>
           <button
@@ -290,7 +388,7 @@ function App() {
               style={styles.input}
               value={subscribeTag}
               onChange={(event) => setSubscribeTag(event.target.value)}
-              placeholder="Koala"
+              placeholder="canis_familiaris"
             />
           </label>
           <button style={styles.button} type="button" onClick={handleSubscribe}>
@@ -301,6 +399,8 @@ function App() {
 
       <section style={styles.responseSection}>
         <h2 style={styles.sectionTitle}>Response</h2>
+        {loading && <p>Loading...</p>}
+        {renderResults()}
         <pre style={styles.pre}>{JSON.stringify(response, null, 2)}</pre>
       </section>
     </main>
@@ -317,10 +417,14 @@ const styles = {
       'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
   },
   title: {
-    margin: '0 0 24px',
+    margin: '0 0 6px',
     fontSize: '36px',
     fontWeight: 800,
     lineHeight: 1.1
+  },
+  subtitle: {
+    margin: '0 0 24px',
+    color: '#5d6d66'
   },
   grid: {
     display: 'grid',
@@ -410,6 +514,52 @@ const styles = {
     background: '#17352a',
     fontSize: '13px',
     lineHeight: 1.5
+  },
+  resultsGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
+    gap: '14px'
+  },
+  card: {
+    padding: '14px',
+    border: '1px solid #d7e1dc',
+    borderRadius: '8px',
+    background: '#f8fbf9'
+  },
+  cardTitle: {
+    marginTop: 0
+  },
+  thumbnail: {
+    width: '100%',
+    maxWidth: '260px',
+    borderRadius: '8px',
+    border: '1px solid #cbd8d1'
+  },
+  videoLabel: {
+    padding: '10px',
+    borderRadius: '6px',
+    background: '#e8f1ec',
+    fontWeight: 700
+  },
+  linkButton: {
+    display: 'inline-block',
+    margin: '8px 0',
+    padding: '8px 10px',
+    borderRadius: '6px',
+    background: '#1f6f50',
+    color: '#ffffff',
+    textDecoration: 'none',
+    fontWeight: 700
+  },
+  smallPre: {
+    maxHeight: '110px',
+    overflow: 'auto',
+    padding: '8px',
+    borderRadius: '6px',
+    background: '#edf3ef',
+    fontSize: '12px',
+    whiteSpace: 'pre-wrap',
+    wordBreak: 'break-all'
   }
 }
 
