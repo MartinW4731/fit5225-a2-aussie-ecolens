@@ -284,7 +284,7 @@ def lambda_handler(event, context):
         table.put_item(Item=item)
 
         print("Inserted new item into DynamoDB:")
-        print(json.dumps(item, indent=2))
+        print(json.dumps(item, indent=2, default=str))
 
         results.append({
             "file_name": file_name,
@@ -303,5 +303,5 @@ def lambda_handler(event, context):
         "body": json.dumps({
             "message": "S3 upload event processed with checksum deduplication, thumbnail generation, and Oracle ML detection",
             "results": results
-        })
+        }, default=str)
     }
