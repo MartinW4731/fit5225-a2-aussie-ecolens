@@ -7,6 +7,7 @@ import re
 import base64
 import urllib.request
 from datetime import datetime, timezone
+from decimal import Decimal
 from boto3.dynamodb.conditions import Attr
 from PIL import Image
 from io import BytesIO
@@ -14,22 +15,21 @@ from io import BytesIO
 s3 = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table("AussieEcoLensMedia")
-ORACLE_DETECT_URL = "http://161.33.88.163:8080/detect"
 
-def calculate_sha256(bucket_name, object_key):
-    response = s3.get_object(Bucket=bucket_name, Key=object_key)
-    file_bytes = response["Body"].read()
+ORACLE_DETECT_URL = "http://158.179.17.163:8080/detect"
+ORACLE_VIDEO_DETECT_URL = "http://158.179.17.163:8080/detect-video"
+ORACLE_ANNOTATE_URL = "http://158.179.17.163:8080/annotate"
+
+
+def calculate_sha256(file_bytes):
     return hashlib.sha256(file_bytes).hexdigest()
 
-def create_thumbnail(bucket_name, object_key, file_name):
-    response = s3.get_object(Bucket=bucket_name, Key=object_key)
-    image_bytes = response["Body"].read()
 
+def create_thumbnail(bucket_name, object_key, file_name, image_bytes):
     image = Image.open(BytesIO(image_bytes))
     image.thumbnail((200, 200))
 
     thumb_buffer = BytesIO()
-
     image_format = image.format if image.format else "JPEG"
 
     if image_format.upper() in ["JPEG", "JPG"] and image.mode in ("RGBA", "P"):
@@ -40,27 +40,21 @@ def create_thumbnail(bucket_name, object_key, file_name):
 
     thumbnail_key = f"thumbnails/{file_name}"
 
-    content_type = response.get("ContentType", "image/jpeg")
-
     s3.put_object(
         Bucket=bucket_name,
         Key=thumbnail_key,
         Body=thumb_buffer,
-        ContentType=content_type
+        ContentType="image/jpeg"
     )
 
     print(f"Thumbnail created: {thumbnail_key}")
 
     return thumbnail_key
 
+
 def generate_basic_tags(file_name):
-    # Remove file extension
     name_without_ext = file_name.rsplit(".", 1)[0].lower()
-
-    # Split by underscore, hyphen, space, or number
     words = re.split(r"[_\-\s\d]+", name_without_ext)
-
-    # Remove empty words and very short meaningless words
     words = [word for word in words if word and len(word) > 1]
 
     tags = {}
@@ -68,111 +62,29 @@ def generate_basic_tags(file_name):
     for word in words:
         tags[word] = tags.get(word, 0) + 1
 
-    # Optional general tags
-    tags["image"] = 1
+    tags["unknown"] = 1
 
     return tags
 
-def lambda_handler(event, context):
-    print("Received event:")
-    print(json.dumps(event, indent=2))
+def convert_floats_to_decimal(obj):
+    if isinstance(obj, float):
+        return Decimal(str(obj))
 
-    results = []
+    if isinstance(obj, dict):
+        return {
+            key: convert_floats_to_decimal(value)
+            for key, value in obj.items()
+        }
 
-    for record in event.get("Records", []):
-        bucket_name = record["s3"]["bucket"]["name"]
-        object_key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
+    if isinstance(obj, list):
+        return [
+            convert_floats_to_decimal(value)
+            for value in obj
+        ]
 
-        # Only process files inside uploads/
-        if not object_key.startswith("uploads/"):
-            print(f"Skipped non-upload object: {object_key}")
-            continue
+    return obj
 
-        file_name = object_key.split("/")[-1]
-        file_extension = file_name.split(".")[-1].lower() if "." in file_name else ""
 
-        if file_extension in ["jpg", "jpeg", "png"]:
-            file_type = "image"
-        elif file_extension in ["mp4", "mov", "avi"]:
-            file_type = "video"
-        else:
-            file_type = "unknown"
-
-        # Calculate checksum
-        checksum = calculate_sha256(bucket_name, object_key)
-        print(f"Checksum for {object_key}: {checksum}")
-
-        image_response = s3.get_object(Bucket=bucket_name, Key=object_key)
-        image_bytes = image_response["Body"].read()
-
-        # Check if same checksum already exists in DynamoDB
-        duplicate_check = table.scan(
-            FilterExpression=Attr("checksum").eq(checksum)
-        )
-
-        existing_items = duplicate_check.get("Items", [])
-
-        if existing_items:
-            print("Duplicate file detected.")
-            print(json.dumps(existing_items, indent=2, default=str))
-
-            # Delete duplicate object from S3 to save storage
-            s3.delete_object(Bucket=bucket_name, Key=object_key)
-            print(f"Deleted duplicate object from S3: {object_key}")
-
-            results.append({
-                "file_name": file_name,
-                "status": "duplicate_deleted",
-                "checksum": checksum
-            })
-
-            continue
-
-        file_id = str(uuid.uuid4())
-
-        thumbnail_url = ""
-
-        if file_type == "image":
-            thumbnail_key = create_thumbnail(bucket_name, object_key, file_name)
-            thumbnail_url = f"s3://{bucket_name}/{thumbnail_key}"
-
-        tags = {}
-
-        if file_type == "image":
-            tags = call_oracle_species_detector(file_name, file_type, image_bytes)
-
-        item = {
-                "file_id": file_id,
-                "bucket": bucket_name,
-                "s3_key": object_key,
-                "file_name": file_name,
-                "file_type": file_type,
-                "file_url": f"s3://{bucket_name}/{object_key}",
-                "thumbnail_url": thumbnail_url,
-                "tags": tags,
-                "checksum": checksum,
-                "created_at": datetime.now(timezone.utc).isoformat()
-            }
-
-        table.put_item(Item=item)
-
-        print("Inserted new item into DynamoDB:")
-        print(json.dumps(item, indent=2))
-
-        results.append({
-            "file_name": file_name,
-            "status": "inserted_with_thumbnail" if file_type == "image" else "inserted",
-            "checksum": checksum,
-            "thumbnail_url": thumbnail_url
-        })
-
-    return {
-        "statusCode": 200,
-        "body": json.dumps({
-            "message": "S3 upload event processed with checksum deduplication and thumbnail generation",
-            "results": results
-        })
-    }
 def call_oracle_species_detector(file_name, file_type, image_bytes):
     image_base64 = base64.b64encode(image_bytes).decode("utf-8")
 
@@ -192,22 +104,204 @@ def call_oracle_species_detector(file_name, file_type, image_bytes):
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        print(f"Calling Oracle image ML endpoint: {ORACLE_DETECT_URL}")
+        print(f"Sending image file_name to Oracle: {file_name}")
+
+        with urllib.request.urlopen(request, timeout=90) as response:
             response_body = response.read().decode("utf-8")
             result = json.loads(response_body)
 
-        print("Oracle ML response:")
+        print("Oracle image ML response:")
         print(json.dumps(result, indent=2))
 
         tags = result.get("tags", {})
+        confidence = result.get("confidence", {})
+        source = result.get("source", "Oracle ML detection")
 
         if tags:
-            return tags
+            return tags, confidence, source
 
-        print("Oracle response did not include tags. Falling back to basic tags.")
-        return generate_basic_tags(file_name)
+        print("Oracle image response did not include tags. Falling back to basic tags.")
+        return generate_basic_tags(file_name), {}, "fallback_basic_tags"
 
     except Exception as e:
-        print(f"Oracle ML detection failed: {str(e)}")
+        print(f"Oracle image ML detection failed: {str(e)}")
         print("Falling back to basic tags.")
-        return generate_basic_tags(file_name)
+        return generate_basic_tags(file_name), {}, "fallback_basic_tags"
+
+
+def call_oracle_video_detector(file_name, file_type, video_bytes):
+    video_base64 = base64.b64encode(video_bytes).decode("utf-8")
+
+    payload = {
+        "file_name": file_name,
+        "file_type": file_type,
+        "video_base64": video_base64
+    }
+
+    data = json.dumps(payload).encode("utf-8")
+
+    request = urllib.request.Request(
+        ORACLE_VIDEO_DETECT_URL,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    try:
+        print(f"Calling Oracle video ML endpoint: {ORACLE_VIDEO_DETECT_URL}")
+        print(f"Sending video file_name to Oracle: {file_name}")
+
+        with urllib.request.urlopen(request, timeout=240) as response:
+            response_body = response.read().decode("utf-8")
+            result = json.loads(response_body)
+
+        print("Oracle video ML response:")
+        print(json.dumps(result, indent=2))
+
+        tags = result.get("tags", {})
+        confidence = result.get("confidence", {})
+        frames_processed = result.get("frames_processed", 0)
+        source = result.get("source", "Oracle ML detection")
+
+        if tags:
+            return tags, confidence, frames_processed, source
+
+        print("Oracle video response did not include tags. Falling back to basic tags.")
+        return generate_basic_tags(file_name), {}, frames_processed, "fallback_basic_tags"
+
+    except Exception as e:
+        print(f"Oracle video ML detection failed: {str(e)}")
+        print("Falling back to basic tags.")
+        return generate_basic_tags(file_name), {}, 0, "fallback_basic_tags"
+
+
+def lambda_handler(event, context):
+    print("Received event:")
+    print(json.dumps(event, indent=2))
+
+    results = []
+
+    for record in event.get("Records", []):
+        bucket_name = record["s3"]["bucket"]["name"]
+        object_key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
+
+        if not object_key.startswith("uploads/"):
+            print(f"Skipped non-upload object: {object_key}")
+            continue
+
+        file_name = object_key.split("/")[-1]
+        file_extension = file_name.split(".")[-1].lower() if "." in file_name else ""
+
+        if file_extension in ["jpg", "jpeg", "png"]:
+            file_type = "image"
+        elif file_extension in ["mp4", "mov", "avi"]:
+            file_type = "video"
+        else:
+            file_type = "unknown"
+
+        file_response = s3.get_object(Bucket=bucket_name, Key=object_key)
+        file_bytes = file_response["Body"].read()
+
+        checksum = calculate_sha256(file_bytes)
+        print(f"Checksum for {object_key}: {checksum}")
+
+        duplicate_check = table.scan(
+            FilterExpression=Attr("checksum").eq(checksum)
+        )
+
+        existing_items = duplicate_check.get("Items", [])
+
+        if existing_items:
+            print("Duplicate file detected.")
+            print(json.dumps(existing_items, indent=2, default=str))
+
+            s3.delete_object(Bucket=bucket_name, Key=object_key)
+            print(f"Deleted duplicate object from S3: {object_key}")
+
+            results.append({
+                "file_name": file_name,
+                "status": "duplicate_deleted",
+                "checksum": checksum
+            })
+
+            continue
+
+        file_id = str(uuid.uuid4())
+
+        thumbnail_url = ""
+
+        if file_type == "image":
+            thumbnail_key = create_thumbnail(
+                bucket_name,
+                object_key,
+                file_name,
+                file_bytes
+            )
+            thumbnail_url = f"s3://{bucket_name}/{thumbnail_key}"
+
+        tags = {}
+        confidence = {}
+        frames_processed = 0
+        ml_source = ""
+
+        if file_type == "image":
+            tags, confidence, ml_source = call_oracle_species_detector(
+                file_name,
+                file_type,
+                file_bytes
+            )
+
+        elif file_type == "video":
+            tags, confidence, frames_processed, ml_source = call_oracle_video_detector(
+                file_name,
+                file_type,
+                file_bytes
+            )
+
+        else:
+            tags = generate_basic_tags(file_name)
+            ml_source = "fallback_basic_tags"
+
+        item = {
+            "file_id": file_id,
+            "bucket": bucket_name,
+            "s3_key": object_key,
+            "file_name": file_name,
+            "file_type": file_type,
+            "file_url": f"s3://{bucket_name}/{object_key}",
+            "thumbnail_url": thumbnail_url,
+            "tags": tags,
+            "confidence": confidence,
+            "frames_processed": frames_processed,
+            "ml_source": ml_source,
+            "checksum": checksum,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+
+        item = convert_floats_to_decimal(item)
+
+        table.put_item(Item=item)
+
+        print("Inserted new item into DynamoDB:")
+        print(json.dumps(item, indent=2))
+
+        results.append({
+            "file_name": file_name,
+            "file_type": file_type,
+            "status": "inserted_with_thumbnail" if file_type == "image" else "inserted",
+            "checksum": checksum,
+            "thumbnail_url": thumbnail_url,
+            "tags": tags,
+            "confidence": confidence,
+            "frames_processed": frames_processed,
+            "ml_source": ml_source
+        })
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "message": "S3 upload event processed with checksum deduplication, thumbnail generation, and Oracle ML detection",
+            "results": results
+        })
+    }
