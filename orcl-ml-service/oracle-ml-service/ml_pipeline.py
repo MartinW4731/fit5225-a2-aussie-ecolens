@@ -1,14 +1,17 @@
 import base64
+import io
 import os
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import numpy as np
 import torch
 import torchvision.transforms as transforms
 import yaml
 import cv2
 from PIL import Image
 from megadetector.detection import run_detector_batch
+
 
 SERVICE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SERVICE_DIR / "config.yaml"
@@ -264,3 +267,202 @@ def process_image_path(image_path: Path, pipeline: Dict) -> Tuple[Dict[str, int]
         predictions.append((species, score))
 
     return aggregate_predictions(predictions)
+
+
+def get_detections_with_boxes(
+    image_path: Path, pipeline: Dict
+) -> Tuple[Dict[str, int], Dict[str, float], List[Tuple[int, int, int, int, str, float]]]:
+    """
+    Run detection and return boxes along with species labels.
+    Returns (tags, confidence, boxes_list) where boxes_list is [(x1, y1, x2, y2, species, confidence), ...]
+    """
+    config = pipeline.get("config", {})
+    detections = run_megadetector(image_path)
+
+    image = Image.open(image_path).convert("RGB")
+    width, height = image.size
+
+    boxes_with_species: List[Tuple[int, int, int, int, str, float]] = []
+    crops_for_classification: List[Tuple[Image.Image, int, int, int, int]] = []
+
+    try:
+        lower_conf = float(config.get("LOWER_CONF", 0.05))
+
+        for detection in detections:
+            if not is_animal_detection(detection):
+                continue
+
+            confidence = float(detection.get("conf", 0.0))
+            if confidence < lower_conf:
+                continue
+
+            bbox = detection.get("bbox")
+            if not bbox or len(bbox) != 4:
+                continue
+
+            x, y, w, h = bbox
+            left = max(0, int(x * width))
+            top = max(0, int(y * height))
+            right = min(width, int((x + w) * width))
+            bottom = min(height, int((y + h) * height))
+
+            if right <= left or bottom <= top:
+                continue
+
+            crop = image.crop((left, top, right, bottom)).convert("RGB")
+            crops_for_classification.append((crop, left, top, right, bottom))
+    finally:
+        image.close()
+
+    if not crops_for_classification:
+        return {"no_animal_detected": 0}, {"no_animal_detected": 0.0}, []
+
+    predictions: List[Tuple[str, float]] = []
+    for crop, left, top, right, bottom in crops_for_classification:
+        species, score = classify_crop(
+            crop,
+            pipeline["model"],
+            pipeline["labels"],
+            pipeline["transform"],
+            pipeline["device"],
+        )
+        predictions.append((species, score))
+        boxes_with_species.append((left, top, right, bottom, species, score))
+
+    tags, confidence = aggregate_predictions(predictions)
+    return tags, confidence, boxes_with_species
+
+
+def annotate_image_path(image_path: Path, pipeline: Dict) -> Tuple[Dict[str, int], Dict[str, float], str]:
+    """
+    Run detection and return annotated image as base64.
+    Returns (tags, confidence, annotated_image_base64)
+    """
+    tags, confidence, boxes_with_species = get_detections_with_boxes(image_path, pipeline)
+
+    image = Image.open(image_path).convert("RGB")
+    image_cv = np.array(image)
+
+    if boxes_with_species:
+        h, w = image_cv.shape[:2]
+
+        for left, top, right, bottom, species, score in boxes_with_species:
+            left, top, right, bottom = int(left), int(top), int(right), int(bottom)
+            left = max(0, left)
+            top = max(0, top)
+            right = min(w, right)
+            bottom = min(h, bottom)
+
+            cv2.rectangle(image_cv, (left, top), (right, bottom), (0, 255, 0), 2)
+            label = f"{species} ({score:.2f})"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.5
+            thickness = 1
+            text_size = cv2.getTextSize(label, font, font_scale, thickness)[0]
+            text_x = left
+            text_y = max(top - 5, text_size[1])
+            cv2.rectangle(image_cv, (text_x, text_y - text_size[1] - 5), (text_x + text_size[0], text_y + 5), (0, 255, 0), -1)
+            cv2.putText(image_cv, label, (text_x, text_y), font, font_scale, (0, 0, 0), thickness)
+
+    image_annotated = Image.fromarray(image_cv)
+    image_bytes = io.BytesIO()
+    image_annotated.save(image_bytes, format="JPEG")
+    image_base64 = base64.b64encode(image_bytes.getvalue()).decode("utf-8")
+
+    return tags, confidence, image_base64
+
+
+def annotate_video_path(video_path: Path, pipeline: Dict) -> Tuple[Dict[str, int], Dict[str, float], List[str], int]:
+    """
+    Run video detection and return list of annotated frames as base64.
+    Returns (tags, confidence, annotated_frames_base64_list, frames_processed)
+    """
+    if not video_path.exists():
+        raise ValueError("video file does not exist")
+
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        capture.release()
+        raise ValueError("video cannot be opened")
+
+    fps = capture.get(cv2.CAP_PROP_FPS) or 0.0
+    frame_interval = int(fps) if fps and fps > 0 else 1
+    if frame_interval < 1:
+        frame_interval = 1
+
+    frame_number = 0
+    processed_frames = 0
+    aggregate_tags: Dict[str, int] = {}
+    aggregate_confidence: Dict[str, float] = {}
+    annotated_frames_b64: List[str] = []
+
+    try:
+        while True:
+            ret, frame = capture.read()
+            if not ret:
+                break
+
+            if frame_number % frame_interval == 0:
+                frame_path = Path(f"/tmp/frame_{processed_frames}.jpg")
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                image_pil = Image.fromarray(frame_rgb)
+                image_pil.save(frame_path)
+
+                try:
+                    tags, confidence, boxes_with_species = get_detections_with_boxes(frame_path, pipeline)
+
+                    if boxes_with_species:
+                        frame_annotated = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        h, w = frame_annotated.shape[:2]
+
+                        for left, top, right, bottom, species, score in boxes_with_species:
+                            left, top, right, bottom = int(left), int(top), int(right), int(bottom)
+                            left = max(0, left)
+                            top = max(0, top)
+                            right = min(w, right)
+                            bottom = min(h, bottom)
+
+                            cv2.rectangle(frame_annotated, (left, top), (right, bottom), (0, 255, 0), 2)
+                            label = f"{species} ({score:.2f})"
+                            font = cv2.FONT_HERSHEY_SIMPLEX
+                            font_scale = 0.5
+                            thickness = 1
+                            text_size = cv2.getTextSize(label, font, font_scale, thickness)[0]
+                            text_x = left
+                            text_y = max(top - 5, text_size[1])
+                            cv2.rectangle(frame_annotated, (text_x, text_y - text_size[1] - 5), (text_x + text_size[0], text_y + 5), (0, 255, 0), -1)
+                            cv2.putText(frame_annotated, label, (text_x, text_y), font, font_scale, (0, 0, 0), thickness)
+                    else:
+                        frame_annotated = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+                    image_pil_annotated = Image.fromarray(frame_annotated)
+                    img_bytes = io.BytesIO()
+                    image_pil_annotated.save(img_bytes, format="JPEG")
+                    frame_b64 = base64.b64encode(img_bytes.getvalue()).decode("utf-8")
+                    annotated_frames_b64.append(frame_b64)
+
+                    if not (tags == {"no_animal_detected": 0} and confidence == {"no_animal_detected": 0.0}):
+                        for species, count in tags.items():
+                            aggregate_tags[species] = aggregate_tags.get(species, 0) + count
+                        for species, score in confidence.items():
+                            aggregate_confidence[species] = max(aggregate_confidence.get(species, 0.0), score)
+
+                finally:
+                    try:
+                        if frame_path.exists():
+                            frame_path.unlink()
+                    except OSError:
+                        pass
+
+                processed_frames += 1
+
+            frame_number += 1
+    finally:
+        capture.release()
+
+    if processed_frames == 0:
+        return {"no_frame_processed": 0}, {"no_frame_processed": 0.0}, [], 0
+    if not aggregate_tags:
+        return {"no_animal_detected": 0}, {"no_animal_detected": 0.0}, annotated_frames_b64, processed_frames
+
+    return aggregate_tags, aggregate_confidence, annotated_frames_b64, processed_frames
