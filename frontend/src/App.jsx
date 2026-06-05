@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
 import { fromCognitoIdentityPool } from '@aws-sdk/credential-provider-cognito-identity'
+import koalaPlaceholder from './assets/picture-koala.png'
 import './App.css'
 
 const API_BASE_URL = 'https://qpl03337ra.execute-api.ap-southeast-2.amazonaws.com'
@@ -31,7 +32,14 @@ function App() {
   const [thumbnailUrl, setThumbnailUrl] = useState('')
   const [queryFile, setQueryFile] = useState(null)
   const [uploadMediaFile, setUploadMediaFile] = useState(null)
-  const [uploadPreviewUrl, setUploadPreviewUrl] = useState('')
+  const [uploadMediaFiles, setUploadMediaFiles] = useState([])
+  const [uploadPreviewItems, setUploadPreviewItems] = useState([])
+  const [uploadLightboxIndex, setUploadLightboxIndex] = useState(null)
+  const [uploadToast, setUploadToast] = useState(null)
+  const [uploadedMediaSignatures, setUploadedMediaSignatures] = useState([])
+  const [uploadProcessedRecord, setUploadProcessedRecord] = useState(null)
+  const [uploadMetadataStatus, setUploadMetadataStatus] = useState('idle')
+  const uploadPollIdRef = useRef(0)
 
   const [updateUrls, setUpdateUrls] = useState('')
   const [updateTags, setUpdateTags] = useState('')
@@ -126,16 +134,53 @@ function App() {
   }, [])
 
   useEffect(() => {
-    if (!uploadMediaFile || !uploadMediaFile.type.startsWith('image/')) {
-      setUploadPreviewUrl('')
+    if (uploadMediaFiles.length === 0) {
+      setUploadPreviewItems([])
       return undefined
     }
 
-    const previewUrl = URL.createObjectURL(uploadMediaFile)
-    setUploadPreviewUrl(previewUrl)
+    const previewItems = uploadMediaFiles.map((file) => ({
+      file,
+      previewUrl: URL.createObjectURL(file)
+    }))
 
-    return () => URL.revokeObjectURL(previewUrl)
-  }, [uploadMediaFile])
+    setUploadPreviewItems(previewItems)
+
+    return () => {
+      previewItems.forEach((item) => URL.revokeObjectURL(item.previewUrl))
+    }
+  }, [uploadMediaFiles])
+
+  useEffect(() => {
+    if (uploadLightboxIndex === null) return undefined
+
+    const handleKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        setUploadLightboxIndex(null)
+      }
+
+      if (event.key === 'ArrowLeft') {
+        setUploadLightboxIndex((currentIndex) =>
+          currentIndex === null
+            ? currentIndex
+            : (currentIndex - 1 + uploadPreviewItems.length) %
+                uploadPreviewItems.length
+        )
+      }
+
+      if (event.key === 'ArrowRight') {
+        setUploadLightboxIndex((currentIndex) =>
+          currentIndex === null
+            ? currentIndex
+            : (currentIndex + 1) % uploadPreviewItems.length
+        )
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [uploadLightboxIndex, uploadPreviewItems.length])
 
   const splitLines = (value) =>
     value
@@ -335,6 +380,33 @@ function App() {
     }
   }
 
+  const fetchApiData = async (endpoint, payload) => {
+    const headers = {
+      'Content-Type': 'application/json'
+    }
+
+    if (idToken) {
+      headers.Authorization = `Bearer ${idToken}`
+    }
+
+    const res = await fetch(`${API_BASE_URL}${endpoint}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    })
+
+    const data = await res.json()
+
+    if (!res.ok) {
+      throw new Error(data.error || data.message || `Request failed with ${res.status}`)
+    }
+
+    return {
+      status: res.status,
+      ...data
+    }
+  }
+
   const requireLogin = () => {
     if (!idToken) {
       setResponse({
@@ -493,6 +565,181 @@ function App() {
     }
   }
 
+  const isDuplicateUploadResponse = (uploadResponse) => {
+    const message = String(uploadResponse?.message || '').toLowerCase()
+    const status = String(uploadResponse?.status || '').toLowerCase()
+
+    return Boolean(
+      uploadResponse?.duplicate ||
+        uploadResponse?.isDuplicate ||
+        uploadResponse?.skipped ||
+        message.includes('duplicate') ||
+        status.includes('duplicate') ||
+        status.includes('skipped')
+    )
+  }
+
+  const getUploadFileSignature = (file) =>
+    `${file.name}|${file.type}|${file.size}|${file.lastModified}`
+
+  const recordHasProcessedMetadata = (record) =>
+    Boolean(
+      record &&
+        ((record.tags && Object.keys(record.tags).length > 0) ||
+          (record.confidence && Object.keys(record.confidence).length > 0) ||
+          (record.confidence_scores && Object.keys(record.confidence_scores).length > 0) ||
+          (Array.isArray(record.detected_species) && record.detected_species.length > 0) ||
+          (Array.isArray(record.species) && record.species.length > 0))
+    )
+
+  const parseApiEnvelope = (data) => {
+    if (typeof data?.body === 'string') {
+      try {
+        return {
+          ...data,
+          ...JSON.parse(data.body)
+        }
+      } catch {
+        return data
+      }
+    }
+
+    return data
+  }
+
+  const collectMetadataCandidates = (metadataResponse) => {
+    const parsedResponse = parseApiEnvelope(metadataResponse)
+    const candidateGroups = [
+      parsedResponse.results,
+      parsedResponse.items,
+      parsedResponse.records,
+      parsedResponse.media,
+      parsedResponse.matches,
+      parsedResponse.result ? [parsedResponse.result] : null,
+      parsedResponse.record ? [parsedResponse.record] : null,
+      parsedResponse.file_url ? [parsedResponse] : null
+    ].filter(Boolean)
+
+    return candidateGroups
+      .flat()
+      .filter(Boolean)
+      .map((item) => ({
+        ...item,
+        ...(item.media || {}),
+        ...(item.record || {}),
+        ...(item.file || {}),
+        tags:
+          item.tags ||
+          item.detected_tags ||
+          item.detectedTags ||
+          item.media?.tags ||
+          item.record?.tags ||
+          item.file?.tags ||
+          {},
+        confidence:
+          item.confidence ||
+          item.confidence_scores ||
+          item.media?.confidence ||
+          item.record?.confidence ||
+          item.file?.confidence ||
+          {}
+      }))
+  }
+
+  const isUploadedMetadataRecord = (record, uploadResponse) => {
+    const identifiers = [
+      uploadResponse.file_url,
+      uploadResponse.key,
+      uploadResponse.request?.file_name,
+      uploadResponse.thumbnail_url
+    ].filter(Boolean)
+
+    const recordValues = [
+      record.file_url,
+      record.original_url,
+      record.media_url,
+      record.s3_url,
+      record.s3_key,
+      record.key,
+      record.file_name,
+      record.thumbnail_url
+    ].filter(Boolean)
+
+    return identifiers.some((identifier) =>
+      recordValues.some((value) => value === identifier)
+    )
+  }
+
+  const pollUploadedMediaMetadata = async (uploadResponse) => {
+    const pollId = uploadPollIdRef.current + 1
+    uploadPollIdRef.current = pollId
+
+    const lookupPayload = {
+      file_url: uploadResponse.file_url,
+      s3_key: uploadResponse.key,
+      key: uploadResponse.key,
+      file_name: uploadResponse.request?.file_name,
+      thumbnail_url: uploadResponse.thumbnail_url
+    }
+
+    console.log('Upload metadata polling identifiers:', {
+      file_url: uploadResponse.file_url,
+      s3_key: uploadResponse.key,
+      file_name: uploadResponse.request?.file_name,
+      thumbnail_url: uploadResponse.thumbnail_url
+    })
+    console.log('Upload metadata polling request payload:', lookupPayload)
+
+    setUploadProcessedRecord(null)
+    setUploadMetadataStatus('polling')
+
+    const maxAttempts = 11
+
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      if (attempt > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 3000))
+      }
+
+      if (uploadPollIdRef.current !== pollId) {
+        return
+      }
+
+      try {
+        const metadataResponse = await fetchApiData('/query/by-tags', lookupPayload)
+        const metadataCandidates = collectMetadataCandidates(metadataResponse)
+        const processedRecord = metadataCandidates.find((item) =>
+          isUploadedMetadataRecord(item, uploadResponse)
+        )
+
+        console.log('Upload metadata polling response:', metadataResponse)
+        console.log('Upload metadata matched record:', processedRecord || null)
+
+        if (processedRecord) {
+          if (uploadPollIdRef.current !== pollId) {
+            return
+          }
+
+          setUploadProcessedRecord(processedRecord)
+
+          if (recordHasProcessedMetadata(processedRecord)) {
+            setUploadMetadataStatus('ready')
+            return
+          }
+        }
+      } catch (error) {
+        console.error(error)
+      }
+    }
+
+    if (uploadPollIdRef.current !== pollId) {
+      return
+    }
+
+    setUploadMetadataStatus((currentStatus) =>
+      currentStatus === 'ready' ? currentStatus : 'timeout'
+    )
+  }
+
   const handleUploadMedia = async () => {
     if (!requireLogin()) return
 
@@ -513,6 +760,7 @@ function App() {
     }
 
     setLoading(true)
+    setUploadToast(null)
 
     try {
       const credentials = fromCognitoIdentityPool({
@@ -550,7 +798,7 @@ function App() {
 
       await s3Client.send(command)
 
-      setResponse({
+      const uploadResponse = {
         endpoint: 'Cognito Identity Pool + S3 PutObject',
         status: 200,
         message:
@@ -571,8 +819,32 @@ function App() {
         file_url: fileUrl,
         next_step:
           'Wait a few seconds, then search by the detected species tag or check the matching results.'
-      })
+      }
+
+      setResponse(uploadResponse)
+      setUploadedMediaSignatures((currentSignatures) => [
+        ...new Set([
+          ...currentSignatures,
+          getUploadFileSignature(uploadMediaFile)
+        ])
+      ])
+      setUploadToast(
+        isDuplicateUploadResponse(uploadResponse)
+          ? {
+              type: 'duplicate',
+              title: 'Duplicate detected',
+              message: 'This file has already been uploaded, so the upload was skipped.'
+            }
+          : {
+              type: 'success',
+              title: 'Upload successful',
+              message:
+                'Your media has been uploaded and is being processed for species detection.'
+            }
+      )
+      pollUploadedMediaMetadata(uploadResponse)
     } catch (error) {
+      console.error(error)
       setResponse({
         endpoint: 'Cognito Identity Pool + S3 PutObject',
         message: 'S3 upload failed',
@@ -580,6 +852,8 @@ function App() {
         troubleshooting:
           'Check Identity Pool authenticated role S3 permissions, User Pool ID, App client ID, token, and S3 CORS.'
       })
+      setUploadToast(null)
+      setUploadMetadataStatus('idle')
     } finally {
       setLoading(false)
     }
@@ -742,41 +1016,355 @@ function App() {
     )
   }
 
-  const renderDeveloperResponse = () => (
-    <details className="developer-response">
-      <summary>Developer Details / Raw API Details</summary>
-      <div className="developer-grid">
-        <div>
-          <h3>Endpoint</h3>
-          <pre className="response-pre">
-            {response.endpoint || 'No endpoint called yet'}
-          </pre>
+  const renderUploadSuccessCard = () => {
+    if (
+      response.endpoint !== 'Cognito Identity Pool + S3 PutObject' ||
+      response.error ||
+      isDuplicateUploadResponse(response)
+    ) {
+      return null
+    }
+
+    const uploadedFiles = response.uploaded_files || []
+    const fileName =
+      uploadedFiles.length > 1
+        ? uploadedFiles.map((file) => file.file_name).join(', ')
+        : response.request?.file_name || uploadMediaFile?.name || 'Not available'
+    const fileType =
+      uploadedFiles.length > 1
+        ? [
+            ...new Set(
+              uploadedFiles.map((file) => file.file_type || 'Unknown media type')
+            )
+          ].join(', ')
+        : response.request?.file_type || uploadMediaFile?.type || 'Unknown media type'
+    const fileUrl =
+      uploadedFiles.length > 1
+        ? uploadedFiles.map((file) => file.file_url).join(', ')
+        : response.file_url || 'Not returned'
+    const processingStatus =
+      uploadMetadataStatus === 'ready'
+        ? 'Processed'
+        : uploadMetadataStatus === 'timeout'
+          ? 'Processing pending'
+          : 'Processing pending'
+
+    return (
+      <div className="upload-success-card" role="status" aria-live="polite">
+        <div className="upload-success-header">
+          <strong>
+            Upload successful. The file is now being processed for thumbnail
+            generation, ML tagging, and database insertion.
+          </strong>
+          <span>Uploaded to S3</span>
         </div>
-        <div>
-          <h3>HTTP Status</h3>
-          <pre className="response-pre">
-            {response.status ? String(response.status) : 'Not available'}
-          </pre>
+
+        <dl className="upload-success-list">
+          <div>
+            <dt>File name</dt>
+            <dd>{fileName}</dd>
+          </div>
+          <div>
+            <dt>File type</dt>
+            <dd>{fileType}</dd>
+          </div>
+          <div>
+            <dt>S3 URL</dt>
+            <dd>{fileUrl}</dd>
+          </div>
+          <div>
+            <dt>Processing status</dt>
+            <dd>{processingStatus}</dd>
+          </div>
+        </dl>
+
+        <p>
+          Wait a few seconds, then verify this file using Search By Species or
+          Search By Tags.
+        </p>
+      </div>
+    )
+  }
+
+  const renderUploadNoticeCard = () => {
+    if (response.endpoint === 'Cognito Identity Pool + S3 PutObject' && response.error) {
+      return (
+        <div className="error-panel">
+          <strong>Upload failed</strong>
+          <span>{response.error}</span>
         </div>
-        <div>
-          <h3>Raw API Request</h3>
-          <pre className="response-pre">
-            {JSON.stringify(response.request || {}, null, 2)}
-          </pre>
+      )
+    }
+
+    if (!response.endpoint && response.message && response.message !== initialResponse.message) {
+      return (
+        <div className="summary-card upload-inline-notice">
+          <strong>{response.message}</strong>
         </div>
+      )
+    }
+
+    return null
+  }
+
+  const getUploadSpecies = () => {
+    const metadataSource = uploadProcessedRecord || response
+    const speciesFields = [
+      metadataSource.detected_species,
+      metadataSource.species,
+      metadataSource.label,
+      metadataSource.detectedSpecies
+    ]
+
+    return speciesFields.flatMap((value) => {
+      if (!value) return []
+      if (Array.isArray(value)) return value
+      if (typeof value === 'object') return Object.keys(value)
+      return [String(value)]
+    })
+  }
+
+  const formatSpeciesDisplayName = (value) =>
+    String(value)
+      .replace(/_/g, ' ')
+      .trim()
+      .replace(/^./, (character) => character.toUpperCase())
+
+  const getUploadTagEntries = () => {
+    const metadataSource = uploadProcessedRecord || response
+    const tagFields = [
+      metadataSource.tags,
+      metadataSource.detected_tags,
+      metadataSource.detectedTags
+    ]
+
+    return tagFields.flatMap((value) => {
+      if (!value) return []
+      if (Array.isArray(value)) {
+        return value.map((tag) => [String(tag), 1])
+      }
+      if (typeof value === 'object') {
+        return Object.entries(value).map(([tag, count]) => [String(tag), count])
+      }
+      return [[String(value), 1]]
+    })
+  }
+
+  const getUploadConfidenceEntries = () => {
+    const metadataSource = uploadProcessedRecord || response
+    const confidence = metadataSource.confidence || metadataSource.confidence_scores || {}
+
+    if (!confidence || typeof confidence !== 'object' || Array.isArray(confidence)) {
+      return []
+    }
+
+    return Object.entries(confidence)
+  }
+
+  const formatConfidenceValue = (value) => {
+    return String(value)
+  }
+
+  const renderUploadDetectionSummary = () => {
+    if (
+      response.endpoint !== 'Cognito Identity Pool + S3 PutObject' ||
+      response.error ||
+      isDuplicateUploadResponse(response)
+    ) {
+      return null
+    }
+
+    const speciesValues = [...new Set(getUploadSpecies().filter(Boolean))]
+    const tagEntries = getUploadTagEntries()
+    const confidenceEntries = getUploadConfidenceEntries()
+    const hasProcessedRecord = Boolean(uploadProcessedRecord)
+
+    return (
+      <div className="upload-detection-card">
         <div>
-          <h3>Raw API Response</h3>
-          <pre className="response-pre">{JSON.stringify(response, null, 2)}</pre>
+          <h3>Processing status</h3>
+          <div className="upload-chip-list">
+            {uploadMetadataStatus === 'ready' ? (
+              <span>Processed</span>
+            ) : uploadMetadataStatus === 'polling' ? (
+              <span className="pending-chip">Processing pending</span>
+            ) : uploadMetadataStatus === 'timeout' ? (
+              <span className="pending-chip">
+                Metadata not found yet. Verify via Search By Tags or Search By Species.
+              </span>
+            ) : (
+              <span className="pending-chip">Processing pending</span>
+            )}
+          </div>
+        </div>
+
+        <div>
+          <h3>Detected species</h3>
+          <div className="upload-chip-list">
+            {speciesValues.length > 0 ? (
+              speciesValues.map((value) => (
+                <span key={value}>{formatSpeciesDisplayName(value)}</span>
+              ))
+            ) : tagEntries.length > 0 ? (
+              [...new Set(tagEntries.map(([tag]) => tag))].map((tag) => (
+                <span key={tag}>{formatSpeciesDisplayName(tag)}</span>
+              ))
+            ) : (
+              <span className="pending-chip">Species detection pending</span>
+            )}
+          </div>
+        </div>
+
+        <div>
+          <h3>Tags</h3>
+          <div className="upload-chip-list">
+            {tagEntries.length > 0 ? (
+              tagEntries.map(([tag, count]) => (
+                <span key={tag}>
+                  {tag} ({count})
+                </span>
+              ))
+            ) : (
+              <span className="pending-chip">Tags will appear after processing</span>
+            )}
+          </div>
+        </div>
+
+        <div>
+          <h3>Confidence</h3>
+          <div className="upload-chip-list">
+            {confidenceEntries.length > 0 ? (
+              confidenceEntries.map(([tag, value]) => (
+                <span key={tag}>
+                  {tag}: {formatConfidenceValue(value)}
+                </span>
+              ))
+            ) : hasProcessedRecord ? (
+              <span className="pending-chip">No confidence values returned</span>
+            ) : (
+              <span className="pending-chip">Confidence will appear after processing</span>
+            )}
+          </div>
         </div>
       </div>
-    </details>
+    )
+  }
+
+  const renderUploadLightbox = () => {
+    if (uploadLightboxIndex === null || uploadPreviewItems.length === 0) {
+      return null
+    }
+
+    const item = uploadPreviewItems[uploadLightboxIndex]
+    const hasMultipleItems = uploadPreviewItems.length > 1
+
+    return (
+      <div
+        className="media-lightbox"
+        role="dialog"
+        aria-modal="true"
+        onClick={() => setUploadLightboxIndex(null)}
+      >
+        <button
+          type="button"
+          className="lightbox-close"
+          onClick={() => setUploadLightboxIndex(null)}
+          aria-label="Close preview"
+        >
+          Close
+        </button>
+
+        {hasMultipleItems && (
+          <button
+            type="button"
+            className="lightbox-nav lightbox-nav-left"
+            onClick={(event) => {
+              event.stopPropagation()
+              setUploadLightboxIndex(
+                (uploadLightboxIndex - 1 + uploadPreviewItems.length) %
+                  uploadPreviewItems.length
+              )
+            }}
+            aria-label="Previous media"
+          >
+            {'<'}
+          </button>
+        )}
+
+        <div className="lightbox-content" onClick={(event) => event.stopPropagation()}>
+          {item.file.type.startsWith('video/') ? (
+            <video src={item.previewUrl} controls />
+          ) : (
+            <img src={item.previewUrl} alt={item.file.name} />
+          )}
+          <div className="lightbox-caption">
+            <strong>{item.file.name}</strong>
+            <span>
+              {item.file.type || 'Unknown media type'} | {formatFileSize(item.file.size)}
+            </span>
+          </div>
+        </div>
+
+        {hasMultipleItems && (
+          <button
+            type="button"
+            className="lightbox-nav lightbox-nav-right"
+            onClick={(event) => {
+              event.stopPropagation()
+              setUploadLightboxIndex(
+                (uploadLightboxIndex + 1) % uploadPreviewItems.length
+              )
+            }}
+            aria-label="Next media"
+          >
+            {'>'}
+          </button>
+        )}
+      </div>
+    )
+  }
+
+  const renderUploadFeedbackOverlay = () => (
+    <>
+      {loading && (
+        <div className="upload-feedback-overlay" role="status" aria-live="polite">
+          <div className="upload-feedback-modal">
+            <span className="spinner" aria-hidden="true" />
+            <strong>Uploading and processing media...</strong>
+            <p>Please wait while the file is uploaded and prepared for species detection.</p>
+          </div>
+        </div>
+      )}
+
+      {uploadToast && !loading && (
+        <div
+          className="upload-feedback-overlay"
+          role="dialog"
+          aria-modal="true"
+          onClick={() => setUploadToast(null)}
+        >
+          <div
+            className={`upload-feedback-modal upload-feedback-${uploadToast.type}`}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <strong>{uploadToast.title}</strong>
+            <p>{uploadToast.message}</p>
+            <button type="button" onClick={() => setUploadToast(null)}>
+              OK
+            </button>
+          </div>
+        </div>
+      )}
+    </>
   )
 
-  const renderResponsePanel = ({ showDetectedTags = false, showResults = false } = {}) => (
+  const renderResponsePanel = ({
+    showDetectedTags = false,
+    showResults = false
+  } = {}) => (
     <section className="response-section">
       <div className="section-heading">
         <h2>Response</h2>
-        {response.endpoint && <span>{response.endpoint}</span>}
       </div>
 
       {loading && (
@@ -796,7 +1384,6 @@ function App() {
       {showDetectedTags && renderDetectedTags()}
       {renderFriendlySummary(showResults)}
       {showResults && renderResults()}
-      {renderDeveloperResponse()}
     </section>
   )
 
@@ -807,6 +1394,12 @@ function App() {
       return (
         <div className="summary-card">
           <strong>{response.message}</strong>
+          <img
+            className="response-placeholder-image"
+            src={koalaPlaceholder}
+            alt=""
+            aria-hidden="true"
+          />
         </div>
       )
     }
@@ -819,18 +1412,7 @@ function App() {
       return <DeleteSummary response={response} />
     }
 
-    if (response.endpoint === 'Cognito Identity Pool + S3 PutObject') {
-      return (
-        <div className="summary-card">
-          <strong>{response.message || 'Upload completed.'}</strong>
-          <span>File URL: {response.file_url || 'Not returned'}</span>
-          <span>
-            Upload used Cognito Identity Pool temporary AWS credentials. Backend
-            processing may take a few seconds.
-          </span>
-        </div>
-      )
-    }
+    if (response.endpoint === 'Cognito Identity Pool + S3 PutObject') return null
 
     if (response.endpoint === '/query/by-upload' && response.detected_tags) {
       return (
@@ -849,6 +1431,12 @@ function App() {
         <div className="empty-results">
           <strong>No matching media files found.</strong>
           <span>Try a different tag, species, uploaded file, or thumbnail URL.</span>
+          <img
+            className="response-placeholder-image"
+            src={koalaPlaceholder}
+            alt=""
+            aria-hidden="true"
+          />
         </div>
       )
     }
@@ -925,43 +1513,47 @@ function App() {
   const renderDashboard = () => (
     <section className="dashboard-page">
       <div className="dashboard-hero">
-        <p className="eyebrow">AWS + Oracle wildlife media platform</p>
-        <h1>Aussie EcoLens</h1>
-        <p>
-          Search, inspect, and manage wildlife media using Cognito authentication,
-          AWS Lambda APIs, S3, DynamoDB, and Oracle ML detection.
-        </p>
-
-        {authUser && (
-          <div className="summary-card">
-            <strong>Signed in with Cognito</strong>
-            <span>{authUser.email || authUser.username || authUser.sub}</span>
-          </div>
-        )}
+        <div>
+          <p className="eyebrow">AWS + Oracle wildlife media platform</p>
+          <h1>Welcome to Aussie EcoLens</h1>
+          <p>
+            Upload, search, inspect, and manage wildlife media from one desktop
+            workspace.
+          </p>
+        </div>
       </div>
 
-      <div className="dashboard-grid">
-        <button type="button" className="dashboard-card" onClick={() => navigateTo('upload-media')}>
+      <div className="dashboard-primary-grid">
+        <button type="button" className="dashboard-card dashboard-card-large" onClick={() => navigateTo('upload-media')}>
+          <span className="dashboard-card-icon" aria-hidden="true">UP</span>
           <span>Upload Media</span>
-          <p>Upload images and videos into S3 using Cognito temporary credentials.</p>
+          <p>Add wildlife photos and videos, then track processing and detected tags.</p>
         </button>
+        <button type="button" className="dashboard-card dashboard-card-large" onClick={() => navigateTo('search-upload')}>
+          <span className="dashboard-card-icon" aria-hidden="true">AI</span>
+          <span>Search By Uploaded File</span>
+          <p>Use an image or video frame to detect species and find matching media.</p>
+        </button>
+      </div>
+
+      <div className="dashboard-secondary-grid">
         <button type="button" className="dashboard-card" onClick={() => navigateTo('search-tags')}>
+          <span className="dashboard-card-icon" aria-hidden="true">TG</span>
           <span>Search By Tags</span>
           <p>Find media where detected tags meet a minimum count.</p>
         </button>
         <button type="button" className="dashboard-card" onClick={() => navigateTo('search-species')}>
+          <span className="dashboard-card-icon" aria-hidden="true">SP</span>
           <span>Search By Species</span>
           <p>Search for wildlife records by species tag.</p>
         </button>
-        <button type="button" className="dashboard-card" onClick={() => navigateTo('search-upload')}>
-          <span>Search By Uploaded File</span>
-          <p>Upload a query image for Oracle ML detection and similar media search.</p>
-        </button>
         <button type="button" className="dashboard-card" onClick={() => navigateTo('thumbnail')}>
+          <span className="dashboard-card-icon" aria-hidden="true">TH</span>
           <span>Thumbnail Lookup</span>
           <p>Resolve a thumbnail URL back to its original media record.</p>
         </button>
         <button type="button" className="dashboard-card" onClick={() => navigateTo('management')}>
+          <span className="dashboard-card-icon" aria-hidden="true">MG</span>
           <span>Management</span>
           <p>Bulk update tags or delete test media files.</p>
         </button>
@@ -974,66 +1566,64 @@ function App() {
       <section className="page-panel">
         <p className="eyebrow">Permanent media ingestion</p>
         <h1>Upload Media</h1>
-        <p className="page-subtitle">
-          Add images or videos into the media database for future search.
-        </p>
-
-        <div className="notice-card">
-          <strong>Upload Media uses Cognito Identity Pool temporary AWS credentials.</strong>
-          <span>
-            After upload, the existing S3 trigger processes the file, calls Oracle
-            ML, creates metadata, and stores the record in DynamoDB.
-          </span>
-        </div>
 
         <div className="upload-layout">
           <div className="form-card form-card-wide">
             <h2>Select Media</h2>
 
-            <label>
-              Image or video file
+            <label className="upload-picker">
+              <span>Choose Media Files</span>
+              <small>Images and videos are supported</small>
               <input
                 type="file"
+                multiple
                 accept="image/*,video/*"
-                onChange={(event) =>
-                  setUploadMediaFile(event.target.files[0] || null)
-                }
+                onChange={(event) => {
+                  const selectedFiles = Array.from(event.target.files || [])
+                  setUploadMediaFiles(selectedFiles)
+                  setUploadMediaFile(selectedFiles[0] || null)
+                  setUploadLightboxIndex(null)
+                  setUploadToast(null)
+                  setUploadProcessedRecord(null)
+                  setUploadMetadataStatus('idle')
+                  uploadPollIdRef.current += 1
+                  setResponse(initialResponse)
+                }}
               />
             </label>
 
-            {uploadMediaFile ? (
-              <div className="upload-file-summary">
-                <dl>
-                  <div>
-                    <dt>File name</dt>
-                    <dd>{uploadMediaFile.name}</dd>
-                  </div>
-                  <div>
-                    <dt>File type</dt>
-                    <dd>{uploadMediaFile.type || 'Unknown media type'}</dd>
-                  </div>
-                  <div>
-                    <dt>File size</dt>
-                    <dd>{formatFileSize(uploadMediaFile.size)}</dd>
-                  </div>
-                </dl>
-
-                {uploadPreviewUrl && (
-                  <div className="upload-preview">
-                    <img src={uploadPreviewUrl} alt="Selected upload preview" />
-                  </div>
+            {uploadPreviewItems.length > 0 ? (
+              <>
+                <div className="upload-preview-grid">
+                  {uploadPreviewItems.map((item, index) => (
+                    <button
+                      type="button"
+                      className="upload-preview-card"
+                      key={`${item.file.name}-${item.file.size}-${index}`}
+                      onClick={() => setUploadLightboxIndex(index)}
+                    >
+                      <span className="upload-preview-media">
+                        {item.file.type.startsWith('video/') ? (
+                          <video src={item.previewUrl} muted playsInline />
+                        ) : (
+                          <img src={item.previewUrl} alt="" />
+                        )}
+                      </span>
+                      <span className="upload-preview-meta">
+                        <strong>{item.file.name}</strong>
+                        <span>{item.file.type || 'Unknown media type'}</span>
+                        <span>{formatFileSize(item.file.size)}</span>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+                {uploadPreviewItems.length > 1 && (
+                  <p className="helper-text">
+                    Multiple files can be previewed here. Upload Media will upload
+                    the first selected file.
+                  </p>
                 )}
-
-                {uploadMediaFile.type.startsWith('video/') && (
-                  <div className="video-file-indicator">
-                    <strong>Video selected</strong>
-                    <span>
-                      The video will be uploaded to S3 uploads/. The backend
-                      Lambda will process frames and call Oracle ML.
-                    </span>
-                  </div>
-                )}
-              </div>
+              </>
             ) : (
               <p className="helper-text">
                 Choose an image or video file. After upload, wait a few seconds
@@ -1049,47 +1639,35 @@ function App() {
               {loading ? 'Uploading...' : 'Upload Media'}
             </button>
 
-            <p className="helper-text">
-              The file will be uploaded to S3 uploads/. Processing may take a few
-              seconds before it appears in search results.
-            </p>
+            {renderUploadNoticeCard()}
           </div>
 
-          <div className="workflow-card">
-            <h2>Permanent Ingestion Workflow</h2>
-            <ol className="workflow-list">
-              <li>User signs in through Cognito User Pool</li>
-              <li>User token is exchanged through Cognito Identity Pool</li>
-              <li>Authenticated role provides temporary S3 upload permission</li>
-              <li>Frontend uploads directly to S3 uploads/</li>
-              <li>S3 triggers the upload-handler Lambda</li>
-              <li>Oracle ML detects wildlife species</li>
-              <li>Metadata, tags, checksum, and URLs are saved into DynamoDB</li>
-              <li>Media becomes searchable in the UI</li>
-            </ol>
+          <div className="upload-status-column">
+            {renderUploadDetectionSummary() || (
+              <div className="upload-placeholder-card">
+                <h2>Processing status</h2>
+                <p>Upload media to view detected species, tags, and confidence values.</p>
+              </div>
+            )}
+          </div>
+
+          <div className="upload-summary-column">
+            {renderUploadSuccessCard() || (
+              <div className="upload-placeholder-card">
+                <h2>Latest upload</h2>
+                <p>Upload details will appear here after the selected file reaches storage.</p>
+              </div>
+            )}
+
+            <p className="helper-text">
+              Processing may take a few seconds before the file appears in search
+              results.
+            </p>
           </div>
         </div>
-
-        <details className="developer-response upload-notes">
-          <summary>Developer Notes</summary>
-          <div className="developer-note-body">
-            <p>
-              This page is different from Search By Uploaded File. Search By
-              Uploaded File is a temporary query upload and does not permanently
-              store the query image.
-            </p>
-            <p>
-              Upload Media is permanent ingestion. It uploads the selected file to
-              S3 uploads/ using Cognito Identity Pool temporary AWS credentials,
-              then the existing S3-triggered Lambda runs checksum detection,
-              thumbnail generation, Oracle ML detection, SNS notification, and
-              DynamoDB insertion.
-            </p>
-          </div>
-        </details>
       </section>
-
-      {renderResponsePanel()}
+      {renderUploadLightbox()}
+      {renderUploadFeedbackOverlay()}
     </>
   )
 
@@ -1293,13 +1871,6 @@ function App() {
           <small>Wildlife media console</small>
         </div>
 
-        {authUser && (
-          <div className="signed-in-box">
-            <small>Signed in as</small>
-            <span>{authUser.email || authUser.username || authUser.sub}</span>
-          </div>
-        )}
-
         <nav className="nav-menu" aria-label="Main navigation">
           <NavButton currentPage={currentPage} page="dashboard" onClick={navigateTo}>
             Dashboard / Home
@@ -1394,10 +1965,11 @@ function ResultCard({ item, onPreview }) {
             <span>Click Preview to open the video result.</span>
           </div>
         ) : (
-          <div className="thumbnail-fallback">
-            <strong>No browser preview</strong>
-            <span>{item.thumbnail_url || item.file_url || 'No media URL'}</span>
-          </div>
+          <img
+            className="thumbnail-placeholder-image"
+            src={koalaPlaceholder}
+            alt="Preview placeholder"
+          />
         )}
       </button>
 

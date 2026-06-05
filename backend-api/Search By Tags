@@ -26,6 +26,55 @@ def get_required_tags(body):
 
     return required_tags
 
+def get_lookup_fields(body):
+    """Read optional direct media lookup fields."""
+    return {
+        "file_url": body.get("file_url") or body.get("fileUrl"),
+        "s3_key": body.get("s3_key") or body.get("s3Key") or body.get("key"),
+        "file_name": body.get("file_name") or body.get("fileName"),
+        "thumbnail_url": body.get("thumbnail_url") or body.get("thumbnailUrl")
+    }
+
+def normalize_key(value):
+    """Use one comparison form for tag/species matching."""
+    return str(value).strip().lower()
+
+def normalize_tag_counts(tags):
+    """Return case-insensitive tag counts while preserving counts."""
+    normalized_tags = {}
+
+    if isinstance(tags, dict):
+        for tag, count in tags.items():
+            normalized_tag = normalize_key(tag)
+            if not normalized_tag:
+                continue
+            normalized_tags[normalized_tag] = normalized_tags.get(normalized_tag, 0) + int(count)
+
+    if isinstance(tags, list):
+        for tag in tags:
+            normalized_tag = normalize_key(tag)
+            if not normalized_tag:
+                continue
+            normalized_tags[normalized_tag] = normalized_tags.get(normalized_tag, 0) + 1
+
+    return normalized_tags
+
+def normalize_species_values(value):
+    """Read species-style attributes stored as a string, list, or dict."""
+    if not value:
+        return set()
+
+    if isinstance(value, str):
+        return {normalize_key(value)}
+
+    if isinstance(value, list):
+        return {normalize_key(item) for item in value if normalize_key(item)}
+
+    if isinstance(value, dict):
+        return {normalize_key(item) for item in value.keys() if normalize_key(item)}
+
+    return set()
+
 def lambda_handler(event, context):
     print("Received event:")
     print(json.dumps(event, indent=2))
@@ -47,9 +96,19 @@ def lambda_handler(event, context):
         # {
         #   "species": "casuarius"
         # }
-        required_tags = get_required_tags(body)
+        lookup_fields = {
+            key: value
+            for key, value in get_lookup_fields(body).items()
+            if value
+        }
 
-        if not required_tags:
+        required_tags = {
+            normalize_key(tag): int(count)
+            for tag, count in get_required_tags(body).items()
+            if normalize_key(tag)
+        }
+
+        if not required_tags and not lookup_fields:
             return {
                 "statusCode": 400,
                 "headers": {
@@ -72,14 +131,31 @@ def lambda_handler(event, context):
         matched_results = []
 
         for item in items:
+            if lookup_fields:
+                lookup_matched = any(
+                    item.get(field_name) == field_value
+                    for field_name, field_value in lookup_fields.items()
+                )
+
+                if not lookup_matched:
+                    continue
+
             item_tags = item.get("tags", {})
+            normalized_item_tags = normalize_tag_counts(item_tags)
+            normalized_species = set()
+
+            for species_field in ["species", "detected_species", "detectedSpecies"]:
+                normalized_species.update(normalize_species_values(item.get(species_field)))
 
             matched = True
 
             # Logical AND:
             # every requested tag must exist and meet the minimum count.
             for tag, required_count in required_tags.items():
-                actual_count = int(item_tags.get(tag, 0))
+                actual_count = int(normalized_item_tags.get(tag, 0))
+                if actual_count == 0 and tag in normalized_species:
+                    actual_count = 1
+
                 if actual_count < int(required_count):
                     matched = False
                     break
@@ -89,9 +165,13 @@ def lambda_handler(event, context):
                     "file_id": item.get("file_id"),
                     "file_name": item.get("file_name"),
                     "file_type": item.get("file_type"),
+                    "s3_key": item.get("s3_key"),
                     "file_url": item.get("file_url"),
                     "thumbnail_url": item.get("thumbnail_url"),
-                    "tags": item_tags
+                    "tags": item_tags,
+                    "species": item.get("species", []),
+                    "detected_species": item.get("detected_species", []),
+                    "confidence": item.get("confidence", {})
                 })
 
         return {

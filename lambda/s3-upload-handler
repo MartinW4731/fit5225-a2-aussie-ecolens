@@ -70,6 +70,15 @@ def generate_basic_tags(file_name):
 
     return tags
 
+def infer_species_from_tags(tags):
+    """Store species-like labels in addition to tags for search compatibility."""
+    generic_tags = {"image", "video", "media", "upload"}
+    return [
+        tag
+        for tag in tags.keys()
+        if tag not in generic_tags
+    ]
+
 def lambda_handler(event, context):
     print("Received event:")
     print(json.dumps(event, indent=2))
@@ -135,6 +144,8 @@ def lambda_handler(event, context):
         if file_type == "image":
             tags = generate_basic_tags(file_name)
 
+        detected_species = infer_species_from_tags(tags)
+
         item = {
                 "file_id": file_id,
                 "bucket": bucket_name,
@@ -144,6 +155,8 @@ def lambda_handler(event, context):
                 "file_url": f"s3://{bucket_name}/{object_key}",
                 "thumbnail_url": thumbnail_url,
                 "tags": tags,
+                "species": detected_species,
+                "detected_species": detected_species,
                 "checksum": checksum,
                 "created_at": datetime.now(timezone.utc).isoformat()
             }
