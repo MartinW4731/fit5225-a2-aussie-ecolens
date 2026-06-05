@@ -392,10 +392,12 @@ function App() {
       const objectKey = `uploads/${shortId}-${safeName}`
       const fileUrl = `s3://${S3_BUCKET}/${objectKey}`
 
+      const fileBuffer = await uploadMediaFile.arrayBuffer()
+
       const command = new PutObjectCommand({
         Bucket: S3_BUCKET,
         Key: objectKey,
-        Body: uploadMediaFile,
+        Body: new Uint8Array(fileBuffer),
         ContentType: uploadMediaFile.type || 'application/octet-stream'
       })
 
