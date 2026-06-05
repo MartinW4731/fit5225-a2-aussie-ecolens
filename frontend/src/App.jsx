@@ -205,6 +205,49 @@ function App() {
       reader.readAsDataURL(file)
     })
 
+  const extractVideoFrameToBase64 = (file) =>
+    new Promise((resolve, reject) => {
+      const video = document.createElement('video')
+      const canvas = document.createElement('canvas')
+      const objectUrl = URL.createObjectURL(file)
+
+      video.preload = 'metadata'
+      video.muted = true
+      video.playsInline = true
+      video.src = objectUrl
+
+      video.onloadedmetadata = () => {
+        const targetTime = Math.min(1, video.duration / 2 || 0)
+        video.currentTime = targetTime
+      }
+
+      video.onseeked = () => {
+        canvas.width = video.videoWidth || 800
+        canvas.height = video.videoHeight || 450
+
+        const ctx = canvas.getContext('2d')
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.75)
+        const base64 = dataUrl.split(',')[1]
+
+        URL.revokeObjectURL(objectUrl)
+
+        resolve({
+          base64,
+          width: canvas.width,
+          height: canvas.height,
+          originalSize: file.size,
+          frameSize: Math.round((base64.length * 3) / 4)
+        })
+      }
+
+      video.onerror = () => {
+        URL.revokeObjectURL(objectUrl)
+        reject(new Error('Could not extract a frame from the selected video.'))
+      }
+    })
+
   const callApi = async (endpoint, payload) => {
     setLoading(true)
 
@@ -345,19 +388,24 @@ function App() {
           compressed_height: compressedImage.height
         }
       } else {
-        const videoBase64 = await fileToBase64(queryFile)
+        const extractedFrame = await extractVideoFrameToBase64(queryFile)
 
         payload = {
-          file_name: queryFile.name,
-          file_type: 'video',
-          video_base64: videoBase64
+          file_name: `${queryFile.name}-extracted-frame.jpg`,
+          file_type: 'image',
+          image_base64: extractedFrame.base64,
+          query_source_type: 'video'
         }
 
         requestDetails = {
           file_name: queryFile.name,
           file_type: 'video',
-          video_base64: '[base64 hidden in UI]',
-          original_size_kb: Math.round(queryFile.size / 1024)
+          query_method: 'video frame extraction',
+          image_base64: '[extracted video frame base64 hidden in UI]',
+          original_size_kb: Math.round(extractedFrame.originalSize / 1024),
+          extracted_frame_size_kb: Math.round(extractedFrame.frameSize / 1024),
+          extracted_frame_width: extractedFrame.width,
+          extracted_frame_height: extractedFrame.height
         }
       }
 
@@ -736,7 +784,7 @@ function App() {
       return (
         <div className="empty-results">
           <strong>No matching media files found.</strong>
-          <span>Try a different tag, species, uploaded image, or thumbnail URL.</span>
+          <span>Try a different tag, species, uploaded file, or thumbnail URL.</span>
         </div>
       )
     }
@@ -1048,8 +1096,8 @@ function App() {
         <div className="form-card form-card-wide">
           <p className="helper-text">
             Upload a query image or a small query video. Image queries are compressed before sending. 
-            Video queries are sent as a temporary API payload and are not permanently stored. 
-            The system detects species tags using Oracle ML, then searches matching media from DynamoDB.
+            For video queries, the browser extracts one representative frame and sends that frame to Oracle ML. 
+            The detected species tags are then used to search matching images and videos from DynamoDB.
           </p>
           <label>
             Query image or video
