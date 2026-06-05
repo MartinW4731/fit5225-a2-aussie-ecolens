@@ -1,7 +1,24 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
+import { fromCognitoIdentityPool } from '@aws-sdk/credential-provider-cognito-identity'
 import './App.css'
 
 const API_BASE_URL = 'https://qpl03337ra.execute-api.ap-southeast-2.amazonaws.com'
+
+const AWS_REGION = 'ap-southeast-2'
+const S3_BUCKET = 'fit5225-a2-aussie-ecolens-media-group157'
+
+const COGNITO_DOMAIN =
+  'https://ap-southeast-2j-x6dlawqs.auth.ap-southeast-2.amazoncognito.com'
+
+const COGNITO_CLIENT_ID = '7dn8uiplfo2aj8fj0kdi4r2tcr'
+const USER_POOL_ID = 'ap-southeast-2_jx6dlAwqs'
+const IDENTITY_POOL_ID =
+  'ap-southeast-2:86dc6553-312f-45d9-9f2c-fc513f79b6e6'
+
+const REDIRECT_URI = 'http://localhost:5173'
+
+const COGNITO_PROVIDER = `cognito-idp.${AWS_REGION}.amazonaws.com/${USER_POOL_ID}`
 
 const initialResponse = {
   message: 'No request submitted yet'
@@ -24,8 +41,89 @@ function App() {
   const [response, setResponse] = useState(initialResponse)
   const [loading, setLoading] = useState(false)
   const [selectedResult, setSelectedResult] = useState(null)
-  const [isAuthenticated, setIsAuthenticated] = useState(false)
-  const [currentPage, setCurrentPage] = useState('login')
+  const [currentPage, setCurrentPage] = useState('dashboard')
+
+  const [idToken, setIdToken] = useState(() => localStorage.getItem('id_token') || '')
+  const [accessToken, setAccessToken] = useState(
+    () => localStorage.getItem('access_token') || ''
+  )
+  const [authUser, setAuthUser] = useState(() => {
+    const stored = localStorage.getItem('auth_user')
+
+    if (!stored) {
+      return null
+    }
+
+    try {
+      return JSON.parse(stored)
+    } catch {
+      return null
+    }
+  })
+
+  const isAuthenticated = Boolean(idToken)
+
+  const cognitoLoginUrl = useMemo(() => {
+    const params = new URLSearchParams({
+      client_id: COGNITO_CLIENT_ID,
+      response_type: 'token',
+      scope: 'openid email profile',
+      redirect_uri: REDIRECT_URI
+    })
+
+    return `${COGNITO_DOMAIN}/login?${params.toString()}`
+  }, [])
+
+  const cognitoSignupUrl = useMemo(() => {
+    const params = new URLSearchParams({
+      client_id: COGNITO_CLIENT_ID,
+      response_type: 'token',
+      scope: 'openid email profile',
+      redirect_uri: REDIRECT_URI
+    })
+
+    return `${COGNITO_DOMAIN}/signup?${params.toString()}`
+  }, [])
+
+  const cognitoLogoutUrl = useMemo(() => {
+    const params = new URLSearchParams({
+      client_id: COGNITO_CLIENT_ID,
+      logout_uri: REDIRECT_URI
+    })
+
+    return `${COGNITO_DOMAIN}/logout?${params.toString()}`
+  }, [])
+
+  useEffect(() => {
+    const hash = window.location.hash
+
+    if (!hash || !hash.includes('id_token=')) {
+      return
+    }
+
+    const params = new URLSearchParams(hash.replace(/^#/, ''))
+    const newIdToken = params.get('id_token') || ''
+    const newAccessToken = params.get('access_token') || ''
+    const expiresIn = params.get('expires_in') || ''
+
+    if (!newIdToken) {
+      return
+    }
+
+    const decodedUser = decodeJwtPayload(newIdToken)
+
+    localStorage.setItem('id_token', newIdToken)
+    localStorage.setItem('access_token', newAccessToken)
+    localStorage.setItem('token_expires_in', expiresIn)
+    localStorage.setItem('auth_user', JSON.stringify(decodedUser))
+
+    setIdToken(newIdToken)
+    setAccessToken(newAccessToken)
+    setAuthUser(decodedUser)
+    setCurrentPage('dashboard')
+
+    window.history.replaceState({}, document.title, window.location.pathname)
+  }, [])
 
   useEffect(() => {
     if (!uploadMediaFile || !uploadMediaFile.type.startsWith('image/')) {
@@ -97,11 +195,17 @@ function App() {
     setLoading(true)
 
     try {
+      const headers = {
+        'Content-Type': 'application/json'
+      }
+
+      if (idToken) {
+        headers.Authorization = `Bearer ${idToken}`
+      }
+
       const res = await fetch(`${API_BASE_URL}${endpoint}`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
+        headers,
         body: JSON.stringify(payload)
       })
 
@@ -125,7 +229,20 @@ function App() {
     }
   }
 
+  const requireLogin = () => {
+    if (!idToken) {
+      setResponse({
+        message: 'Please sign in with Cognito before using this feature.'
+      })
+      return false
+    }
+
+    return true
+  }
+
   const handleSearchTags = () => {
+    if (!requireLogin()) return
+
     const finalTag = tagName.trim()
 
     if (!finalTag) {
@@ -143,6 +260,8 @@ function App() {
   }
 
   const handleSearchSpecies = () => {
+    if (!requireLogin()) return
+
     const finalSpecies = species.trim()
 
     if (!finalSpecies) {
@@ -160,6 +279,8 @@ function App() {
   }
 
   const handleSearchByUploadedFile = async () => {
+    if (!requireLogin()) return
+
     if (!queryFile) {
       setResponse({ message: 'Please choose a query image first.' })
       return
@@ -184,11 +305,17 @@ function App() {
         image_base64: compressedImage.base64
       }
 
+      const headers = {
+        'Content-Type': 'application/json'
+      }
+
+      if (idToken) {
+        headers.Authorization = `Bearer ${idToken}`
+      }
+
       const res = await fetch(`${API_BASE_URL}/query/by-upload`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
+        headers,
         body: JSON.stringify(payload)
       })
 
@@ -220,6 +347,8 @@ function App() {
   }
 
   const handleUploadMedia = async () => {
+    if (!requireLogin()) return
+
     if (!uploadMediaFile) {
       setResponse({ message: 'Please choose an image or video file first.' })
       return
@@ -239,72 +368,68 @@ function App() {
     setLoading(true)
 
     try {
-      const uploadUrlResponse = await fetch(`${API_BASE_URL}/upload-url`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
+      const credentials = fromCognitoIdentityPool({
+        identityPoolId: IDENTITY_POOL_ID,
+        logins: {
+          [COGNITO_PROVIDER]: idToken
         },
-        body: JSON.stringify({
-          file_name: uploadMediaFile.name,
-          file_type: uploadMediaFile.type
-        })
+        clientConfig: {
+          region: AWS_REGION
+        }
       })
 
-      const uploadUrlData = await uploadUrlResponse.json()
-
-      if (!uploadUrlResponse.ok || !uploadUrlData.upload_url) {
-        setResponse({
-          endpoint: '/upload-url',
-          status: uploadUrlResponse.status,
-          request: {
-            file_name: uploadMediaFile.name,
-            file_type: uploadMediaFile.type
-          },
-          ...uploadUrlData
-        })
-        return
-      }
-
-      const s3UploadResponse = await fetch(uploadUrlData.upload_url, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': uploadMediaFile.type
-        },
-        body: uploadMediaFile
+      const s3Client = new S3Client({
+        region: AWS_REGION,
+        credentials
       })
 
-      if (!s3UploadResponse.ok) {
-        setResponse({
-          endpoint: '/upload-url',
-          status: s3UploadResponse.status,
-          message: 'Presigned URL was generated, but S3 upload failed.',
-          file_url: uploadUrlData.file_url,
-          s3_key: uploadUrlData.key
-        })
-        return
-      }
+      const safeName = safeFileName(uploadMediaFile.name)
+      const shortId =
+        typeof crypto !== 'undefined' && crypto.randomUUID
+          ? crypto.randomUUID().slice(0, 8)
+          : String(Date.now())
+
+      const objectKey = `uploads/${shortId}-${safeName}`
+      const fileUrl = `s3://${S3_BUCKET}/${objectKey}`
+
+      const command = new PutObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: objectKey,
+        Body: uploadMediaFile,
+        ContentType: uploadMediaFile.type || 'application/octet-stream'
+      })
+
+      await s3Client.send(command)
 
       setResponse({
-        endpoint: '/upload-url',
+        endpoint: 'Cognito Identity Pool + S3 PutObject',
         status: 200,
         message:
-          'Media uploaded to S3 successfully. The S3 trigger will process it with Lambda and Oracle ML shortly.',
+          'Media uploaded to S3 successfully using Cognito temporary AWS credentials. The S3 trigger will process it with Lambda and Oracle ML shortly.',
         request: {
           file_name: uploadMediaFile.name,
           file_type: uploadMediaFile.type,
           file_size: uploadMediaFile.size
         },
-        bucket: uploadUrlData.bucket,
-        key: uploadUrlData.key,
-        file_url: uploadUrlData.file_url,
+        authentication: {
+          user_pool: USER_POOL_ID,
+          identity_pool: IDENTITY_POOL_ID,
+          signed_in_email:
+            authUser?.email || authUser?.username || authUser?.sub || 'Signed-in user'
+        },
+        bucket: S3_BUCKET,
+        key: objectKey,
+        file_url: fileUrl,
         next_step:
-          'Wait a few seconds, then search by the detected species tag or file name.'
+          'Wait a few seconds, then search by the detected species tag or check the matching results.'
       })
     } catch (error) {
       setResponse({
-        endpoint: '/upload-url',
-        message: 'Upload failed',
-        error: String(error)
+        endpoint: 'Cognito Identity Pool + S3 PutObject',
+        message: 'S3 upload failed',
+        error: String(error),
+        troubleshooting:
+          'Check Identity Pool authenticated role S3 permissions, User Pool ID, App client ID, token, and S3 CORS.'
       })
     } finally {
       setLoading(false)
@@ -312,6 +437,8 @@ function App() {
   }
 
   const handleThumbnailLookup = () => {
+    if (!requireLogin()) return
+
     if (!thumbnailUrl.trim()) {
       setResponse({ message: 'Please enter a thumbnail URL.' })
       return
@@ -325,6 +452,8 @@ function App() {
   }
 
   const handleUpdateTags = () => {
+    if (!requireLogin()) return
+
     const urls = splitLines(updateUrls)
     const tags = tagsToObject(updateTags)
 
@@ -348,6 +477,8 @@ function App() {
   }
 
   const handleDeleteFiles = () => {
+    if (!requireLogin()) return
+
     const urls = splitLines(deleteUrls)
 
     if (urls.length === 0) {
@@ -455,7 +586,9 @@ function App() {
       <div className="developer-grid">
         <div>
           <h3>Endpoint</h3>
-          <pre className="response-pre">{response.endpoint || 'No endpoint called yet'}</pre>
+          <pre className="response-pre">
+            {response.endpoint || 'No endpoint called yet'}
+          </pre>
         </div>
         <div>
           <h3>HTTP Status</h3>
@@ -524,15 +657,14 @@ function App() {
       return <DeleteSummary response={response} />
     }
 
-    if (response.endpoint === '/upload-url' && response.status === 200) {
+    if (response.endpoint === 'Cognito Identity Pool + S3 PutObject') {
       return (
         <div className="summary-card">
           <strong>{response.message || 'Upload completed.'}</strong>
+          <span>File URL: {response.file_url || 'Not returned'}</span>
           <span>
-            File URL: {response.file_url || 'Not returned'}
-          </span>
-          <span>
-            Processing may take a few seconds before the file appears in search results.
+            Upload used Cognito Identity Pool temporary AWS credentials. Backend
+            processing may take a few seconds.
           </span>
         </div>
       )
@@ -575,14 +707,27 @@ function App() {
     setSelectedResult(null)
   }
 
-  const handleLogin = () => {
-    setIsAuthenticated(true)
-    navigateTo('dashboard')
+  const handleSignIn = () => {
+    window.location.href = cognitoLoginUrl
+  }
+
+  const handleSignUp = () => {
+    window.location.href = cognitoSignupUrl
   }
 
   const handleLogout = () => {
-    setIsAuthenticated(false)
-    navigateTo('login')
+    localStorage.removeItem('id_token')
+    localStorage.removeItem('access_token')
+    localStorage.removeItem('token_expires_in')
+    localStorage.removeItem('auth_user')
+
+    setIdToken('')
+    setAccessToken('')
+    setAuthUser(null)
+    setResponse(initialResponse)
+    setCurrentPage('dashboard')
+
+    window.location.href = cognitoLogoutUrl
   }
 
   const renderLoginPage = () => (
@@ -591,19 +736,26 @@ function App() {
         <p className="eyebrow">Aussie EcoLens</p>
         <h1>Sign in</h1>
         <p>
-          Sign in to access the wildlife media search and management console.
+          Sign in or create an account through AWS Cognito to access the wildlife
+          media search and management console.
         </p>
-        <label>
-          Email
-          <input type="email" placeholder="student@example.com" />
-        </label>
-        <label>
-          Password
-          <input type="password" placeholder="Password" />
-        </label>
-        <button type="button" onClick={handleLogin}>
-          Login
+
+        <button type="button" onClick={handleSignIn}>
+          Sign in with Cognito
         </button>
+
+        <button type="button" onClick={handleSignUp}>
+          Create account
+        </button>
+
+        <details className="developer-response">
+          <summary>Authentication Details</summary>
+          <div className="developer-note-body">
+            <p>User Pool: {USER_POOL_ID}</p>
+            <p>Identity Pool: {IDENTITY_POOL_ID}</p>
+            <p>App client: {COGNITO_CLIENT_ID}</p>
+          </div>
+        </details>
       </section>
     </main>
   )
@@ -614,15 +766,22 @@ function App() {
         <p className="eyebrow">AWS + Oracle wildlife media platform</p>
         <h1>Aussie EcoLens</h1>
         <p>
-          Search, inspect, and manage wildlife media using the connected AWS
-          Lambda APIs and Oracle ML detection workflow.
+          Search, inspect, and manage wildlife media using Cognito authentication,
+          AWS Lambda APIs, S3, DynamoDB, and Oracle ML detection.
         </p>
+
+        {authUser && (
+          <div className="summary-card">
+            <strong>Signed in with Cognito</strong>
+            <span>{authUser.email || authUser.username || authUser.sub}</span>
+          </div>
+        )}
       </div>
 
       <div className="dashboard-grid">
         <button type="button" className="dashboard-card" onClick={() => navigateTo('upload-media')}>
           <span>Upload Media</span>
-          <p>Upload images and videos into S3 for permanent ingestion.</p>
+          <p>Upload images and videos into S3 using Cognito temporary credentials.</p>
         </button>
         <button type="button" className="dashboard-card" onClick={() => navigateTo('search-tags')}>
           <span>Search By Tags</span>
@@ -658,7 +817,7 @@ function App() {
         </p>
 
         <div className="notice-card">
-          <strong>Upload Media is connected to S3 using a presigned upload URL.</strong>
+          <strong>Upload Media uses Cognito Identity Pool temporary AWS credentials.</strong>
           <span>
             After upload, the existing S3 trigger processes the file, calls Oracle
             ML, creates metadata, and stores the record in DynamoDB.
@@ -737,9 +896,10 @@ function App() {
           <div className="workflow-card">
             <h2>Permanent Ingestion Workflow</h2>
             <ol className="workflow-list">
-              <li>Select media file in the frontend</li>
-              <li>Request a presigned upload URL from API Gateway</li>
-              <li>Upload directly to S3 uploads/</li>
+              <li>User signs in through Cognito User Pool</li>
+              <li>User token is exchanged through Cognito Identity Pool</li>
+              <li>Authenticated role provides temporary S3 upload permission</li>
+              <li>Frontend uploads directly to S3 uploads/</li>
               <li>S3 triggers the upload-handler Lambda</li>
               <li>Oracle ML detects wildlife species</li>
               <li>Metadata, tags, checksum, and URLs are saved into DynamoDB</li>
@@ -747,46 +907,6 @@ function App() {
             </ol>
           </div>
         </div>
-
-        <section className="future-api-card">
-          <h2>Connected API Contract</h2>
-          <div className="developer-grid">
-            <div>
-              <h3>Endpoint</h3>
-              <pre className="response-pre">POST /upload-url</pre>
-            </div>
-
-            <div>
-              <h3>Request</h3>
-              <pre className="response-pre">
-                {JSON.stringify(
-                  {
-                    file_name: uploadMediaFile?.name || 'example.jpg',
-                    file_type: uploadMediaFile?.type || 'image/jpeg'
-                  },
-                  null,
-                  2
-                )}
-              </pre>
-            </div>
-
-            <div>
-              <h3>Response</h3>
-              <pre className="response-pre">
-                {JSON.stringify(
-                  {
-                    upload_url: 'presigned PUT URL',
-                    file_url:
-                      's3://fit5225-a2-aussie-ecolens-media-group157/uploads/example.jpg',
-                    expires_in_seconds: 900
-                  },
-                  null,
-                  2
-                )}
-              </pre>
-            </div>
-          </div>
-        </section>
 
         <details className="developer-response upload-notes">
           <summary>Developer Notes</summary>
@@ -798,9 +918,10 @@ function App() {
             </p>
             <p>
               Upload Media is permanent ingestion. It uploads the selected file to
-              S3 uploads/, then the existing S3-triggered Lambda runs checksum
-              detection, thumbnail generation, Oracle ML detection, SNS
-              notification, and DynamoDB insertion.
+              S3 uploads/ using Cognito Identity Pool temporary AWS credentials,
+              then the existing S3-triggered Lambda runs checksum detection,
+              thumbnail generation, Oracle ML detection, SNS notification, and
+              DynamoDB insertion.
             </p>
           </div>
         </details>
@@ -988,10 +1109,6 @@ function App() {
   )
 
   const renderCurrentPage = () => {
-    if (!isAuthenticated || currentPage === 'login') {
-      return renderLoginPage()
-    }
-
     if (currentPage === 'search-tags') return renderSearchTagsPage()
     if (currentPage === 'search-species') return renderSearchSpeciesPage()
     if (currentPage === 'upload-media') return renderUploadMediaPage()
@@ -1002,7 +1119,7 @@ function App() {
     return renderDashboard()
   }
 
-  if (!isAuthenticated || currentPage === 'login') {
+  if (!isAuthenticated) {
     return renderLoginPage()
   }
 
@@ -1013,6 +1130,14 @@ function App() {
           <span>Aussie EcoLens</span>
           <small>Wildlife media console</small>
         </div>
+
+        {authUser && (
+          <div className="signed-in-box">
+            <small>Signed in as</small>
+            <span>{authUser.email || authUser.username || authUser.sub}</span>
+          </div>
+        )}
+
         <nav className="nav-menu" aria-label="Main navigation">
           <NavButton currentPage={currentPage} page="dashboard" onClick={navigateTo}>
             Dashboard / Home
@@ -1400,6 +1525,25 @@ function formatFileSize(size) {
   }
 
   return `${(size / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function safeFileName(fileName) {
+  if (!fileName) {
+    return `upload-${Date.now()}`
+  }
+
+  return fileName.replace(/[^A-Za-z0-9._-]/g, '_')
+}
+
+function decodeJwtPayload(token) {
+  try {
+    const [, payload] = token.split('.')
+    const normalisedPayload = payload.replace(/-/g, '+').replace(/_/g, '/')
+    const decoded = atob(normalisedPayload)
+    return JSON.parse(decoded)
+  } catch {
+    return {}
+  }
 }
 
 export default App
