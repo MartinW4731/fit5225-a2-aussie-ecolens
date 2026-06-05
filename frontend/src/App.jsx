@@ -723,7 +723,7 @@ function App() {
     if (response.endpoint === '/query/by-upload' && response.detected_tags) {
       return (
         <div className="summary-card">
-          <strong>Query image processed without permanent UI storage.</strong>
+          <strong>Query file processed without permanent UI storage.</strong>
           <span>
             Detected tags are shown below, followed by matching media returned by
             the API.
@@ -1052,10 +1052,10 @@ function App() {
             The system detects species tags using Oracle ML, then searches matching media from DynamoDB.
           </p>
           <label>
-            Query image
+            Query image or video
             <input
               type="file"
-              accept="image/*",video/*"
+              accept="image/*,video/*"
               onChange={(event) => setQueryFile(event.target.files[0])}
             />
           </label>
@@ -1276,6 +1276,11 @@ function ResultCard({ item, onPreview }) {
       <button className="thumbnail-button" type="button" onClick={onPreview}>
         {thumbnailSrc ? (
           <img src={thumbnailSrc} alt={item.file_name || 'Result thumbnail'} />
+        ) : item.file_type === 'video' ? (
+          <div className="thumbnail-fallback">
+            <strong>Video preview available</strong>
+            <span>Click Preview to open the video result.</span>
+          </div>
         ) : (
           <div className="thumbnail-fallback">
             <strong>No browser preview</strong>
