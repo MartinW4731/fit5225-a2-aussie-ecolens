@@ -191,6 +191,20 @@ function App() {
       reader.readAsDataURL(file)
     })
 
+  const fileToBase64 = (file) =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader()
+
+      reader.onload = () => {
+        const result = reader.result
+        const base64 = result.split(',')[1]
+        resolve(base64)
+      }
+
+      reader.onerror = reject
+      reader.readAsDataURL(file)
+    })
+
   const callApi = async (endpoint, payload) => {
     setLoading(true)
 
@@ -282,14 +296,26 @@ function App() {
     if (!requireLogin()) return
 
     if (!queryFile) {
-      setResponse({ message: 'Please choose a query image first.' })
+      setResponse({ message: 'Please choose a query image or video first.' })
       return
     }
 
-    if (!queryFile.type.startsWith('image/')) {
+    const isImage = queryFile.type.startsWith('image/')
+    const isVideo = queryFile.type.startsWith('video/')
+
+    if (!isImage && !isVideo) {
+      setResponse({
+        message: 'Please choose an image or video file.',
+        file_type: queryFile.type
+      })
+      return
+    }
+
+    if (isVideo && queryFile.size > 5 * 1024 * 1024) {
       setResponse({
         message:
-          'Please choose an image file. Video query upload is not enabled in this UI demo.'
+          'The query video is too large for direct API upload. Please use a video smaller than 5 MB for query-by-upload, or use Upload Media for permanent video ingestion.',
+        file_size_mb: (queryFile.size / (1024 * 1024)).toFixed(2)
       })
       return
     }
@@ -297,12 +323,42 @@ function App() {
     setLoading(true)
 
     try {
-      const compressedImage = await compressImageToBase64(queryFile)
+      let payload
+      let requestDetails
 
-      const payload = {
-        file_name: queryFile.name,
-        file_type: 'image',
-        image_base64: compressedImage.base64
+      if (isImage) {
+        const compressedImage = await compressImageToBase64(queryFile)
+
+        payload = {
+          file_name: queryFile.name,
+          file_type: 'image',
+          image_base64: compressedImage.base64
+        }
+
+        requestDetails = {
+          file_name: queryFile.name,
+          file_type: 'image',
+          image_base64: '[compressed base64 hidden in UI]',
+          original_size_kb: Math.round(compressedImage.originalSize / 1024),
+          compressed_size_kb: Math.round(compressedImage.compressedSize / 1024),
+          compressed_width: compressedImage.width,
+          compressed_height: compressedImage.height
+        }
+      } else {
+        const videoBase64 = await fileToBase64(queryFile)
+
+        payload = {
+          file_name: queryFile.name,
+          file_type: 'video',
+          video_base64: videoBase64
+        }
+
+        requestDetails = {
+          file_name: queryFile.name,
+          file_type: 'video',
+          video_base64: '[base64 hidden in UI]',
+          original_size_kb: Math.round(queryFile.size / 1024)
+        }
       }
 
       const headers = {
@@ -323,15 +379,7 @@ function App() {
 
       setResponse({
         endpoint: '/query/by-upload',
-        request: {
-          file_name: queryFile.name,
-          file_type: 'image',
-          image_base64: '[compressed base64 hidden in UI]',
-          original_size_kb: Math.round(compressedImage.originalSize / 1024),
-          compressed_size_kb: Math.round(compressedImage.compressedSize / 1024),
-          compressed_width: compressedImage.width,
-          compressed_height: compressedImage.height
-        },
+        request: requestDetails,
         status: res.status,
         ...data
       })
@@ -999,15 +1047,15 @@ function App() {
         <h1>Search By Uploaded File</h1>
         <div className="form-card form-card-wide">
           <p className="helper-text">
-            Upload a query image. The frontend compresses it before sending it
-            to the search API. The system detects its species tag using Oracle
-            ML, then searches matching media from DynamoDB.
+            Upload a query image or a small query video. Image queries are compressed before sending. 
+            Video queries are sent as a temporary API payload and are not permanently stored. 
+            The system detects species tags using Oracle ML, then searches matching media from DynamoDB.
           </p>
           <label>
             Query image
             <input
               type="file"
-              accept="image/*"
+              accept="image/*",video/*"
               onChange={(event) => setQueryFile(event.target.files[0])}
             />
           </label>
