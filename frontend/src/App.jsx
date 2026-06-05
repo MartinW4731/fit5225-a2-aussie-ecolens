@@ -208,43 +208,92 @@ function App() {
   const extractVideoFrameToBase64 = (file) =>
     new Promise((resolve, reject) => {
       const video = document.createElement('video')
-      const canvas = document.createElement('canvas')
       const objectUrl = URL.createObjectURL(file)
 
-      video.preload = 'metadata'
+      video.preload = 'auto'
       video.muted = true
       video.playsInline = true
+      video.crossOrigin = 'anonymous'
       video.src = objectUrl
 
-      video.onloadedmetadata = () => {
-        const targetTime = Math.min(1, video.duration / 2 || 0)
-        video.currentTime = targetTime
-      }
+      const captureFrameAt = (time) =>
+        new Promise((resolveFrame, rejectFrame) => {
+          video.onseeked = () => {
+            try {
+              const frameCanvas = document.createElement('canvas')
+              frameCanvas.width = video.videoWidth || 800
+              frameCanvas.height = video.videoHeight || 450
 
-      video.onseeked = () => {
-        canvas.width = video.videoWidth || 800
-        canvas.height = video.videoHeight || 450
+              const frameCtx = frameCanvas.getContext('2d')
+              frameCtx.drawImage(video, 0, 0, frameCanvas.width, frameCanvas.height)
 
-        const ctx = canvas.getContext('2d')
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+              resolveFrame(frameCanvas)
+            } catch (error) {
+              rejectFrame(error)
+            }
+          }
 
-        const dataUrl = canvas.toDataURL('image/jpeg', 0.75)
-        const base64 = dataUrl.split(',')[1]
-
-        URL.revokeObjectURL(objectUrl)
-
-        resolve({
-          base64,
-          width: canvas.width,
-          height: canvas.height,
-          originalSize: file.size,
-          frameSize: Math.round((base64.length * 3) / 4)
+          video.currentTime = Math.min(time, Math.max(video.duration - 0.1, 0))
         })
+
+      video.onloadedmetadata = async () => {
+        try {
+          const duration = video.duration || 1
+          const percentages = [0.1, 0.25, 0.4, 0.55, 0.7, 0.85]
+
+          const times = percentages.map((percentage) =>
+            Math.max(0.1, duration * percentage)
+          )
+
+          const frames = []
+
+          for (const time of times) {
+            const frame = await captureFrameAt(time)
+            frames.push(frame)
+          }
+
+          const frameWidth = frames[0]?.width || 800
+          const frameHeight = frames[0]?.height || 450
+
+          const outputWidth = frameWidth * 3
+          const outputHeight = frameHeight * 2
+
+          const canvas = document.createElement('canvas')
+          canvas.width = outputWidth
+          canvas.height = outputHeight
+
+          const ctx = canvas.getContext('2d')
+
+          frames.forEach((frame, index) => {
+            const x = (index % 3) * frameWidth
+            const y = Math.floor(index / 3) * frameHeight
+
+            ctx.drawImage(frame, x, y, frameWidth, frameHeight)
+          })
+
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.85)
+          const base64 = dataUrl.split(',')[1]
+
+          URL.revokeObjectURL(objectUrl)
+
+          resolve({
+            base64,
+            width: canvas.width,
+            height: canvas.height,
+            originalSize: file.size,
+            frameSize: Math.round((base64.length * 3) / 4),
+            extractedFrames: frames.length,
+            extractedPercentages: percentages
+          })
+        } catch (error) {
+          URL.revokeObjectURL(objectUrl)
+          reject(error)
+        }
       }
 
       video.onerror = () => {
         URL.revokeObjectURL(objectUrl)
-        reject(new Error('Could not extract a frame from the selected video.'))
+        reject(new Error('Could not extract frames from the selected video.'))
       }
     })
 
@@ -400,12 +449,14 @@ function App() {
         requestDetails = {
           file_name: queryFile.name,
           file_type: 'video',
-          query_method: 'video frame extraction',
-          image_base64: '[extracted video frame base64 hidden in UI]',
+          query_method: 'multi-frame video extraction',
+          image_base64: '[extracted video frame sheet base64 hidden in UI]',
           original_size_kb: Math.round(extractedFrame.originalSize / 1024),
-          extracted_frame_size_kb: Math.round(extractedFrame.frameSize / 1024),
-          extracted_frame_width: extractedFrame.width,
-          extracted_frame_height: extractedFrame.height
+          extracted_frame_sheet_size_kb: Math.round(extractedFrame.frameSize / 1024),
+          extracted_frame_sheet_width: extractedFrame.width,
+          extracted_frame_sheet_height: extractedFrame.height,
+          extracted_frames: extractedFrame.extractedFrames,
+          extracted_percentages: extractedFrame.extractedPercentages
         }
       }
 
@@ -635,13 +686,26 @@ function App() {
           {response.uploaded_file_name || response.request?.file_name || ''}
         </p>
 
-        {response.request?.original_size_kb && (
+        {response.request?.original_size_kb && response.request?.compressed_size_kb && (
           <p>
             <strong>Image compression:</strong>{' '}
             {response.request.original_size_kb} KB →{' '}
             {response.request.compressed_size_kb} KB (
             {response.request.compressed_width} ×{' '}
             {response.request.compressed_height})
+          </p>
+        )}
+
+        {response.request?.query_method === 'multi-frame video extraction' && (
+          <p>
+            <strong>Video query extraction:</strong>{' '}
+            {response.request.extracted_frames} frames sampled across the video (
+            {response.request.extracted_percentages
+              ?.map((percentage) => `${Math.round(percentage * 100)}%`)
+              .join(', ')}
+            ), combined into one image sheet{' '}
+            {response.request.extracted_frame_sheet_width} ×{' '}
+            {response.request.extracted_frame_sheet_height}.
           </p>
         )}
 
