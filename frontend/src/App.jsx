@@ -9,7 +9,7 @@ const AWS_REGION = 'ap-southeast-2'
 const S3_BUCKET = 'fit5225-a2-aussie-ecolens-media-group157'
 
 const COGNITO_DOMAIN =
-  'https://ap-southeast-2j-x6dlawqs.auth.ap-southeast-2.amazoncognito.com'
+  'https://ap-southeast-2jx6dlawqs.auth.ap-southeast-2.amazoncognito.com'
 
 const COGNITO_CLIENT_ID = '7dn8uiplfo2aj8fj0kdi4r2tcr'
 const USER_POOL_ID = 'ap-southeast-2_jx6dlAwqs'
