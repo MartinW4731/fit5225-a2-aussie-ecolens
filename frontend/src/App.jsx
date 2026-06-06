@@ -435,7 +435,7 @@ function App() {
     }
   }
 
- const pollUploadedFileProcessingResult = async (fileUrl, maxAttempts = 10) => {
+ const pollUploadedFileProcessingResult = async (fileUrl, maxAttempts = 40) => {
   setUploadProcessingStatus('processing')
   setUploadProcessingResult(null)
 
