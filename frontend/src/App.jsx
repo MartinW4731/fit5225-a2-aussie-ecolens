@@ -1819,16 +1819,21 @@ setUploadProcessingStatus('processing')
     if (response.endpoint === 'Cognito Identity Pool + S3 PutObject') return null
 
     if (response.endpoint === '/query/by-upload' && response.detected_tags) {
-      return (
-        <div className="summary-card">
-          <strong>Query file processed without permanent UI storage.</strong>
-          <span>
-            Detected tags are shown below, followed by matching media returned by
-            the API.
-          </span>
-        </div>
-      )
-    }
+  const resultCount = Array.isArray(response.results) ? response.results.length : 0
+
+  return (
+    <div className="summary-card">
+      <strong>Query file processed without permanent storage.</strong>
+      <span>
+        The uploaded query file was temporarily analysed by Oracle ML. Detected
+        tags are shown below.
+      </span>
+      <span>
+        Matching media found in DynamoDB: {resultCount}
+      </span>
+    </div>
+  )
+}
 
     if (showResults && hasApiResponse(response) && results.length === 0 && !response.error) {
       return (
