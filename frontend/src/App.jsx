@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
 import { fromCognitoIdentityPool } from '@aws-sdk/credential-provider-cognito-identity'
 import koalaPlaceholder from './assets/picture-koala.png'
+import koalaSleepPlaceholder from './assets/koalasleep.png'
 import './App.css'
 
 const API_BASE_URL = 'https://qpl03337ra.execute-api.ap-southeast-2.amazonaws.com'
@@ -26,8 +27,7 @@ const initialResponse = {
 }
 
 function App() {
-  const [tagName, setTagName] = useState('')
-  const [minimumCount, setMinimumCount] = useState(1)
+  const [tagQueries, setTagQueries] = useState([{ tag: '', count: 1 }])
   const [species, setSpecies] = useState('')
   const [thumbnailUrl, setThumbnailUrl] = useState('')
   const [queryFile, setQueryFile] = useState(null)
@@ -39,6 +39,7 @@ function App() {
   const [uploadedMediaSignatures, setUploadedMediaSignatures] = useState([])
   const [uploadProcessedRecord, setUploadProcessedRecord] = useState(null)
   const [uploadMetadataStatus, setUploadMetadataStatus] = useState('idle')
+  const [isUploadDetailsOpen, setIsUploadDetailsOpen] = useState(false)
   const uploadPollIdRef = useRef(0)
 
   const [updateUrls, setUpdateUrls] = useState('')
@@ -46,10 +47,26 @@ function App() {
   const [operation, setOperation] = useState('Add')
 
   const [deleteUrls, setDeleteUrls] = useState('')
-  const [response, setResponse] = useState(initialResponse)
-  const [loading, setLoading] = useState(false)
+  const [responsesByPage, setResponsesByPage] = useState({})
+  const [loadingByPage, setLoadingByPage] = useState({})
   const [selectedResult, setSelectedResult] = useState(null)
   const [currentPage, setCurrentPage] = useState('dashboard')
+  const response = responsesByPage[currentPage] || initialResponse
+  const loading = Boolean(loadingByPage[currentPage])
+  const setPageResponse = (nextResponse, page = currentPage) => {
+    setResponsesByPage((currentResponses) => ({
+      ...currentResponses,
+      [page]: nextResponse
+    }))
+  }
+  const setResponse = setPageResponse
+  const setPageLoading = (isLoading, page = currentPage) => {
+    setLoadingByPage((currentLoading) => ({
+      ...currentLoading,
+      [page]: isLoading
+    }))
+  }
+  const setLoading = setPageLoading
 
   const [idToken, setIdToken] = useState(() => localStorage.getItem('id_token') || '')
   const [accessToken, setAccessToken] = useState(
@@ -199,6 +216,31 @@ function App() {
     return tagObject
   }
 
+  const parseTagSearchQuery = (value, fallbackCount) => {
+    const tagObject = {}
+    const conditions = value
+      .split(/\n|\bAND\b/i)
+      .map((item) => item.trim())
+      .filter(Boolean)
+
+    conditions.forEach((condition) => {
+      const match = condition.match(/^(.+?)(?:\s*(?:>=|:|=)\s*(\d+))?$/)
+      const tag = match?.[1]?.trim()
+      const count = match?.[2]
+
+      if (!tag) return
+
+      tagObject[tag] = Number(count || fallbackCount) || 1
+    })
+
+    return tagObject
+  }
+
+  const formatTagSearchPayloadDescription = (tags) =>
+    Object.entries(tags)
+      .map(([tag, count]) => `${tag} >= ${count}`)
+      .join(' AND ')
+
   const compressImageToBase64 = (file, maxWidth = 800, quality = 0.75) =>
     new Promise((resolve, reject) => {
       const reader = new FileReader()
@@ -343,7 +385,8 @@ function App() {
     })
 
   const callApi = async (endpoint, payload) => {
-    setLoading(true)
+    const responsePage = currentPage
+    setPageLoading(true, responsePage)
 
     try {
       const headers = {
@@ -362,21 +405,21 @@ function App() {
 
       const data = await res.json()
 
-      setResponse({
+      setPageResponse({
         endpoint,
         request: payload,
         status: res.status,
         ...data
-      })
+      }, responsePage)
     } catch (error) {
-      setResponse({
+      setPageResponse({
         endpoint,
         request: payload,
         message: 'Request failed',
         error: String(error)
-      })
+      }, responsePage)
     } finally {
-      setLoading(false)
+      setPageLoading(false, responsePage)
     }
   }
 
@@ -421,20 +464,61 @@ function App() {
   const handleSearchTags = () => {
     if (!requireLogin()) return
 
-    const finalTag = tagName.trim()
+    const finalTags = tagQueries.reduce((tags, query) => {
+      const tag = query.tag.trim()
 
-    if (!finalTag) {
-      setResponse({ message: 'Please enter a tag name.' })
+      if (!tag) return tags
+
+      return {
+        ...tags,
+        [tag]: Number(query.count) || 1
+      }
+    }, {})
+
+    if (Object.keys(finalTags).length === 0) {
+      setResponse({ message: 'Please enter at least one tag.' })
       return
     }
 
     const payload = {
-      tags: {
-        [finalTag]: Number(minimumCount) || 1
-      }
+      tags: finalTags
     }
 
+    console.log('Search By Tags AND query payload:', payload)
+    console.log('Search By Tags AND query:', formatTagSearchPayloadDescription(finalTags))
+
     callApi('/query/by-tags', payload)
+  }
+
+  const updateTagQuery = (index, field, value) => {
+    setTagQueries((currentQueries) =>
+      currentQueries.map((query, queryIndex) =>
+        queryIndex === index
+          ? {
+              ...query,
+              [field]: value
+            }
+          : query
+      )
+    )
+  }
+
+  const addTagQuery = () => {
+    setTagQueries((currentQueries) => [
+      ...currentQueries,
+      {
+        tag: '',
+        count: 1
+      }
+    ])
+  }
+
+  const removeTagQuery = (index) => {
+    setTagQueries((currentQueries) =>
+      currentQueries.length === 1
+        ? currentQueries
+        : currentQueries.filter((_, queryIndex) => queryIndex !== index)
+    )
   }
 
   const handleSearchSpecies = () => {
@@ -458,9 +542,10 @@ function App() {
 
   const handleSearchByUploadedFile = async () => {
     if (!requireLogin()) return
+    const responsePage = currentPage
 
     if (!queryFile) {
-      setResponse({ message: 'Please choose a query image or video first.' })
+      setPageResponse({ message: 'Please choose a query image or video first.' }, responsePage)
       return
     }
 
@@ -468,23 +553,23 @@ function App() {
     const isVideo = queryFile.type.startsWith('video/')
 
     if (!isImage && !isVideo) {
-      setResponse({
+      setPageResponse({
         message: 'Please choose an image or video file.',
         file_type: queryFile.type
-      })
+      }, responsePage)
       return
     }
 
     if (isVideo && queryFile.size > 5 * 1024 * 1024) {
-      setResponse({
+      setPageResponse({
         message:
           'The query video is too large for direct API upload. Please use a video smaller than 5 MB for query-by-upload, or use Upload Media for permanent video ingestion.',
         file_size_mb: (queryFile.size / (1024 * 1024)).toFixed(2)
-      })
+      }, responsePage)
       return
     }
 
-    setLoading(true)
+    setPageLoading(true, responsePage)
 
     try {
       let payload
@@ -548,20 +633,20 @@ function App() {
 
       const data = await res.json()
 
-      setResponse({
+      setPageResponse({
         endpoint: '/query/by-upload',
         request: requestDetails,
         status: res.status,
         ...data
-      })
+      }, responsePage)
     } catch (error) {
-      setResponse({
+      setPageResponse({
         endpoint: '/query/by-upload',
         message: 'Uploaded file search failed',
         error: String(error)
-      })
+      }, responsePage)
     } finally {
-      setLoading(false)
+      setPageLoading(false, responsePage)
     }
   }
 
@@ -579,8 +664,76 @@ function App() {
     )
   }
 
-  const getUploadFileSignature = (file) =>
-    `${file.name}|${file.type}|${file.size}|${file.lastModified}`
+  const getUploadDuplicateKey = (file) => `${file.name}|${file.size}`
+
+  const getRecordFileSize = (record) =>
+    record.file_size ??
+    record.fileSize ??
+    record.size ??
+    record.media?.file_size ??
+    record.record?.file_size ??
+    record.file?.file_size ??
+    record.request?.file_size
+
+  const isSameFileNameAndSize = (record, file) => {
+    const recordFileName =
+      record.file_name ||
+      record.fileName ||
+      record.name ||
+      record.media?.file_name ||
+      record.record?.file_name ||
+      record.file?.file_name ||
+      record.request?.file_name
+    const recordFileSize = getRecordFileSize(record)
+
+    return (
+      recordFileName === file.name &&
+      Number(recordFileSize) === Number(file.size)
+    )
+  }
+
+  const checkUploadDuplicate = async (file) => {
+    const duplicatePayload = {
+      file_name: file.name,
+      file_size: file.size
+    }
+
+    console.log('Upload duplicate check payload:', duplicatePayload)
+
+    if (uploadedMediaSignatures.includes(getUploadDuplicateKey(file))) {
+      console.log('Upload duplicate check response:', {
+        source: 'frontend upload history',
+        duplicate: true,
+        skipped: true
+      })
+      console.log('Upload duplicate detected:', {
+        source: 'frontend upload history',
+        ...duplicatePayload
+      })
+      return true
+    }
+
+    try {
+      const duplicateResponse = await fetchApiData('/query/by-tags', duplicatePayload)
+      console.log('Upload duplicate check response:', duplicateResponse)
+
+      const duplicateCandidates = collectMetadataCandidates(duplicateResponse)
+      const duplicateRecord = duplicateCandidates.find((record) =>
+        isSameFileNameAndSize(record, file)
+      )
+
+      if (duplicateRecord) {
+        console.log('Upload duplicate detected:', duplicateRecord)
+        return true
+      }
+
+      console.log('No duplicate found:', duplicatePayload)
+      return false
+    } catch (error) {
+      console.error('Upload duplicate check failed. Continuing upload.', error)
+      return false
+    }
+  }
 
   const recordHasProcessedMetadata = (record) =>
     Boolean(
@@ -742,9 +895,10 @@ function App() {
 
   const handleUploadMedia = async () => {
     if (!requireLogin()) return
+    const responsePage = currentPage
 
     if (!uploadMediaFile) {
-      setResponse({ message: 'Please choose an image or video file first.' })
+      setPageResponse({ message: 'Please choose an image or video file first.' }, responsePage)
       return
     }
 
@@ -752,14 +906,37 @@ function App() {
       !uploadMediaFile.type.startsWith('image/') &&
       !uploadMediaFile.type.startsWith('video/')
     ) {
-      setResponse({
+      setPageResponse({
         message: 'Only image and video files are supported.',
         file_type: uploadMediaFile.type
-      })
+      }, responsePage)
       return
     }
 
-    setLoading(true)
+    const isDuplicate = await checkUploadDuplicate(uploadMediaFile)
+
+    if (isDuplicate) {
+      setUploadToast({
+        type: 'duplicate',
+        title: 'Duplicate detected',
+        message: 'This file has already been uploaded. Upload skipped.'
+      })
+      setPageResponse({
+        endpoint: 'Frontend duplicate check',
+        message: 'Duplicate detected, upload skipped.',
+        request: {
+          file_name: uploadMediaFile.name,
+          file_size: uploadMediaFile.size
+        },
+        duplicate: true,
+        skipped: true
+      }, responsePage)
+      setUploadMetadataStatus('idle')
+      setUploadProcessedRecord(null)
+      return
+    }
+
+    setPageLoading(true, responsePage)
     setUploadToast(null)
 
     try {
@@ -821,11 +998,12 @@ function App() {
           'Wait a few seconds, then search by the detected species tag or check the matching results.'
       }
 
-      setResponse(uploadResponse)
+      setPageResponse(uploadResponse, responsePage)
+      setIsUploadDetailsOpen(false)
       setUploadedMediaSignatures((currentSignatures) => [
         ...new Set([
           ...currentSignatures,
-          getUploadFileSignature(uploadMediaFile)
+          getUploadDuplicateKey(uploadMediaFile)
         ])
       ])
       setUploadToast(
@@ -845,17 +1023,17 @@ function App() {
       pollUploadedMediaMetadata(uploadResponse)
     } catch (error) {
       console.error(error)
-      setResponse({
+      setPageResponse({
         endpoint: 'Cognito Identity Pool + S3 PutObject',
         message: 'S3 upload failed',
         error: String(error),
         troubleshooting:
           'Check Identity Pool authenticated role S3 permissions, User Pool ID, App client ID, token, and S3 CORS.'
-      })
+      }, responsePage)
       setUploadToast(null)
       setUploadMetadataStatus('idle')
     } finally {
-      setLoading(false)
+      setPageLoading(false, responsePage)
     }
   }
 
@@ -1051,37 +1229,63 @@ function App() {
 
     return (
       <div className="upload-success-card" role="status" aria-live="polite">
-        <div className="upload-success-header">
-          <strong>
-            Upload successful. The file is now being processed for thumbnail
-            generation, ML tagging, and database insertion.
-          </strong>
-          <span>Uploaded to S3</span>
+        <button
+          type="button"
+          className="upload-success-toggle"
+          onClick={() => setIsUploadDetailsOpen((isOpen) => !isOpen)}
+          aria-expanded={isUploadDetailsOpen}
+        >
+          <strong>Upload successful ✓</strong>
+          <span>
+            View details
+            <span
+              className={
+                isUploadDetailsOpen
+                  ? 'upload-success-chevron open'
+                  : 'upload-success-chevron'
+              }
+              aria-hidden="true"
+            >
+              ▼
+            </span>
+          </span>
+        </button>
+
+        <div
+          className={
+            isUploadDetailsOpen
+              ? 'upload-success-details open'
+              : 'upload-success-details'
+          }
+        >
+          <div className="upload-success-details-inner">
+            <p>Upload successful. Processing has started.</p>
+
+            <dl className="upload-success-list">
+              <div>
+                <dt>File name</dt>
+                <dd>{fileName}</dd>
+              </div>
+              <div>
+                <dt>File type</dt>
+                <dd>{fileType}</dd>
+              </div>
+              <div>
+                <dt>S3 URL</dt>
+                <dd>{fileUrl}</dd>
+              </div>
+              <div>
+                <dt>Processing status</dt>
+                <dd>{processingStatus}</dd>
+              </div>
+            </dl>
+
+            <p>
+              Wait a few seconds, then verify this file using Search By Species or
+              Search By Tags.
+            </p>
+          </div>
         </div>
-
-        <dl className="upload-success-list">
-          <div>
-            <dt>File name</dt>
-            <dd>{fileName}</dd>
-          </div>
-          <div>
-            <dt>File type</dt>
-            <dd>{fileType}</dd>
-          </div>
-          <div>
-            <dt>S3 URL</dt>
-            <dd>{fileUrl}</dd>
-          </div>
-          <div>
-            <dt>Processing status</dt>
-            <dd>{processingStatus}</dd>
-          </div>
-        </dl>
-
-        <p>
-          Wait a few seconds, then verify this file using Search By Species or
-          Search By Tags.
-        </p>
       </div>
     )
   }
@@ -1178,74 +1382,95 @@ function App() {
     const tagEntries = getUploadTagEntries()
     const confidenceEntries = getUploadConfidenceEntries()
     const hasProcessedRecord = Boolean(uploadProcessedRecord)
+    const hasRealMetadata =
+      speciesValues.length > 0 || tagEntries.length > 0 || confidenceEntries.length > 0
+    const isProcessingTimeout = uploadMetadataStatus === 'timeout' && !hasRealMetadata
+    const isProcessingMetadata =
+      !hasRealMetadata && !isProcessingTimeout
+    const renderLoadingLine = (label) => (
+      <div className="upload-loading-row" key={label}>
+        <span className="upload-mini-spinner" aria-hidden="true" />
+        <span>{label}</span>
+      </div>
+    )
 
     return (
       <div className="upload-detection-card">
         <div>
           <h3>Processing status</h3>
           <div className="upload-chip-list">
-            {uploadMetadataStatus === 'ready' ? (
-              <span>Processed</span>
-            ) : uploadMetadataStatus === 'polling' ? (
-              <span className="pending-chip">Processing pending</span>
-            ) : uploadMetadataStatus === 'timeout' ? (
-              <span className="pending-chip">
-                Metadata not found yet. Verify via Search By Tags or Search By Species.
+            {hasRealMetadata ? (
+              <span>Processing complete</span>
+            ) : isProcessingTimeout ? (
+              <span className="warning-chip">
+                Processing is taking longer than expected.
               </span>
             ) : (
-              <span className="pending-chip">Processing pending</span>
+              <span className="processing-chip">
+                <span className="upload-mini-spinner" aria-hidden="true" />
+                Processing wildlife detection...
+              </span>
             )}
           </div>
         </div>
 
-        <div>
-          <h3>Detected species</h3>
-          <div className="upload-chip-list">
-            {speciesValues.length > 0 ? (
-              speciesValues.map((value) => (
-                <span key={value}>{formatSpeciesDisplayName(value)}</span>
-              ))
-            ) : tagEntries.length > 0 ? (
-              [...new Set(tagEntries.map(([tag]) => tag))].map((tag) => (
-                <span key={tag}>{formatSpeciesDisplayName(tag)}</span>
-              ))
-            ) : (
-              <span className="pending-chip">Species detection pending</span>
-            )}
+        {isProcessingMetadata ? (
+          <div className="upload-loading-list" aria-live="polite">
+            {[
+              'Detecting species...',
+              'Generating tags...',
+              'Calculating confidence...'
+            ].map(renderLoadingLine)}
           </div>
-        </div>
+        ) : isProcessingTimeout ? (
+          <div className="upload-processing-warning">
+            Processing is taking longer than expected. Please verify the result
+            later using Search By Tags or Search By Species.
+          </div>
+        ) : (
+          <>
+            <div>
+              <h3>Detected species</h3>
+              <div className="upload-chip-list">
+                {speciesValues.length > 0 ? (
+                  speciesValues.map((value) => (
+                    <span key={value}>{formatSpeciesDisplayName(value)}</span>
+                  ))
+                ) : (
+                  [...new Set(tagEntries.map(([tag]) => tag))].map((tag) => (
+                    <span key={tag}>{formatSpeciesDisplayName(tag)}</span>
+                  ))
+                )}
+              </div>
+            </div>
 
-        <div>
-          <h3>Tags</h3>
-          <div className="upload-chip-list">
-            {tagEntries.length > 0 ? (
-              tagEntries.map(([tag, count]) => (
-                <span key={tag}>
-                  {tag} ({count})
-                </span>
-              ))
-            ) : (
-              <span className="pending-chip">Tags will appear after processing</span>
-            )}
-          </div>
-        </div>
+            <div>
+              <h3>Tags</h3>
+              <div className="upload-chip-list">
+                {tagEntries.map(([tag, count]) => (
+                  <span key={tag}>
+                    {tag} ({count})
+                  </span>
+                ))}
+              </div>
+            </div>
 
-        <div>
-          <h3>Confidence</h3>
-          <div className="upload-chip-list">
-            {confidenceEntries.length > 0 ? (
-              confidenceEntries.map(([tag, value]) => (
-                <span key={tag}>
-                  {tag}: {formatConfidenceValue(value)}
-                </span>
-              ))
-            ) : hasProcessedRecord ? (
-              <span className="pending-chip">No confidence values returned</span>
-            ) : (
-              <span className="pending-chip">Confidence will appear after processing</span>
-            )}
-          </div>
-        </div>
+            <div>
+              <h3>Confidence</h3>
+              <div className="upload-chip-list">
+                {confidenceEntries.length > 0 ? (
+                  confidenceEntries.map(([tag, value]) => (
+                    <span key={tag}>
+                      {tag}: {formatConfidenceValue(value)}
+                    </span>
+                  ))
+                ) : hasProcessedRecord ? (
+                  <span className="neutral-chip">No confidence values returned</span>
+                ) : null}
+              </div>
+            </div>
+          </>
+        )}
       </div>
     )
   }
@@ -1361,42 +1586,52 @@ function App() {
   const renderResponsePanel = ({
     showDetectedTags = false,
     showResults = false
-  } = {}) => (
-    <section className="response-section">
-      <div className="section-heading">
-        <h2>Response</h2>
-      </div>
+  } = {}) => {
+    const isPlaceholderResponse =
+      !loading && !response.error && !hasApiResponse(response) && response.message
 
-      {loading && (
-        <div className="loading-banner">
-          <span className="spinner" aria-hidden="true" />
-          Loading API response...
+    return (
+      <section
+        className={
+          isPlaceholderResponse
+            ? 'response-section response-section-placeholder'
+            : 'response-section'
+        }
+      >
+        <div className="section-heading">
+          <h2>Response</h2>
         </div>
-      )}
 
-      {response.error && (
-        <div className="error-panel">
-          <strong>Request error</strong>
-          <span>{response.error}</span>
-        </div>
-      )}
+        {loading && (
+          <div className="loading-banner">
+            <span className="spinner" aria-hidden="true" />
+            Loading API response...
+          </div>
+        )}
 
-      {showDetectedTags && renderDetectedTags()}
-      {renderFriendlySummary(showResults)}
-      {showResults && renderResults()}
-    </section>
-  )
+        {response.error && (
+          <div className="error-panel">
+            <strong>Request error</strong>
+            <span>{response.error}</span>
+          </div>
+        )}
+
+        {showResults && renderResults()}
+        {renderFriendlySummary(showResults)}
+        {showDetectedTags && renderDetectedTags()}
+      </section>
+    )
+  }
 
   const renderFriendlySummary = (showResults) => {
     const results = normaliseResults()
 
     if (!hasApiResponse(response) && response.message) {
       return (
-        <div className="summary-card">
-          <strong>{response.message}</strong>
+        <div className="summary-card summary-card-placeholder">
           <img
             className="response-placeholder-image"
-            src={koalaPlaceholder}
+            src={koalaSleepPlaceholder}
             alt=""
             aria-hidden="true"
           />
@@ -1429,14 +1664,18 @@ function App() {
     if (showResults && hasApiResponse(response) && results.length === 0 && !response.error) {
       return (
         <div className="empty-results">
-          <strong>No matching media files found.</strong>
-          <span>Try a different tag, species, uploaded file, or thumbnail URL.</span>
-          <img
-            className="response-placeholder-image"
-            src={koalaPlaceholder}
-            alt=""
-            aria-hidden="true"
-          />
+          <div className="empty-results-visual">
+            <img
+              className="response-placeholder-image"
+              src={koalaPlaceholder}
+              alt=""
+              aria-hidden="true"
+            />
+            <div className="empty-results-message">
+              <strong>No matching media files found.</strong>
+              <span>Try a different tag, species, uploaded file, or thumbnail URL.</span>
+            </div>
+          </div>
         </div>
       )
     }
@@ -1474,7 +1713,8 @@ function App() {
     setIdToken('')
     setAccessToken('')
     setAuthUser(null)
-    setResponse(initialResponse)
+    setResponsesByPage({})
+    setLoadingByPage({})
     setCurrentPage('dashboard')
 
     window.location.href = cognitoLogoutUrl
@@ -1485,10 +1725,6 @@ function App() {
       <section className="login-card">
         <p className="eyebrow">Aussie EcoLens</p>
         <h1>Sign in</h1>
-        <p>
-          Sign in or create an account through AWS Cognito to access the wildlife
-          media search and management console.
-        </p>
 
         <button type="button" onClick={handleSignIn}>
           Sign in with Cognito
@@ -1506,6 +1742,11 @@ function App() {
             <p>App client: {COGNITO_CLIENT_ID}</p>
           </div>
         </details>
+
+        <p className="login-card-note">
+          Sign in or create an account through AWS Cognito to access the wildlife
+          media search and management console.
+        </p>
       </section>
     </main>
   )
@@ -1525,12 +1766,10 @@ function App() {
 
       <div className="dashboard-primary-grid">
         <button type="button" className="dashboard-card dashboard-card-large" onClick={() => navigateTo('upload-media')}>
-          <span className="dashboard-card-icon" aria-hidden="true">UP</span>
           <span>Upload Media</span>
           <p>Add wildlife photos and videos, then track processing and detected tags.</p>
         </button>
         <button type="button" className="dashboard-card dashboard-card-large" onClick={() => navigateTo('search-upload')}>
-          <span className="dashboard-card-icon" aria-hidden="true">AI</span>
           <span>Search By Uploaded File</span>
           <p>Use an image or video frame to detect species and find matching media.</p>
         </button>
@@ -1538,22 +1777,18 @@ function App() {
 
       <div className="dashboard-secondary-grid">
         <button type="button" className="dashboard-card" onClick={() => navigateTo('search-tags')}>
-          <span className="dashboard-card-icon" aria-hidden="true">TG</span>
           <span>Search By Tags</span>
           <p>Find media where detected tags meet a minimum count.</p>
         </button>
         <button type="button" className="dashboard-card" onClick={() => navigateTo('search-species')}>
-          <span className="dashboard-card-icon" aria-hidden="true">SP</span>
           <span>Search By Species</span>
           <p>Search for wildlife records by species tag.</p>
         </button>
         <button type="button" className="dashboard-card" onClick={() => navigateTo('thumbnail')}>
-          <span className="dashboard-card-icon" aria-hidden="true">TH</span>
           <span>Thumbnail Lookup</span>
           <p>Resolve a thumbnail URL back to its original media record.</p>
         </button>
         <button type="button" className="dashboard-card" onClick={() => navigateTo('management')}>
-          <span className="dashboard-card-icon" aria-hidden="true">MG</span>
           <span>Management</span>
           <p>Bulk update tags or delete test media files.</p>
         </button>
@@ -1586,6 +1821,7 @@ function App() {
                   setUploadToast(null)
                   setUploadProcessedRecord(null)
                   setUploadMetadataStatus('idle')
+                  setIsUploadDetailsOpen(false)
                   uploadPollIdRef.current += 1
                   setResponse(initialResponse)
                 }}
@@ -1680,25 +1916,53 @@ function App() {
             <h1>Search By Tags</h1>
           </div>
         </div>
-        <div className="form-card">
-          <label>
-            Tag name
-            <input
-              value={tagName}
-              onChange={(event) => setTagName(event.target.value)}
-              placeholder="thylogale_stigmatica"
-            />
-          </label>
-          <label>
-            Minimum count
-            <input
-              type="number"
-              min="1"
-              value={minimumCount}
-              onChange={(event) => setMinimumCount(event.target.value)}
-            />
-          </label>
-          <button type="button" onClick={handleSearchTags}>
+        <div className="form-card search-tags-card">
+          <div className="tag-query-list">
+            {tagQueries.map((query, index) => (
+              <div className="tag-query-row" key={index}>
+                <label>
+                  Tag
+                  <input
+                    value={query.tag}
+                    onChange={(event) =>
+                      updateTagQuery(index, 'tag', event.target.value)
+                    }
+                    placeholder="koala"
+                  />
+                </label>
+                <label>
+                  Minimum count
+                  <input
+                    type="number"
+                    min="1"
+                    value={query.count}
+                    onChange={(event) =>
+                      updateTagQuery(index, 'count', event.target.value)
+                    }
+                  />
+                </label>
+                <button
+                  className="tag-query-remove"
+                  type="button"
+                  onClick={() => removeTagQuery(index)}
+                  disabled={tagQueries.length === 1}
+                  aria-label="Remove tag condition"
+                >
+                  −
+                </button>
+              </div>
+            ))}
+          </div>
+          <div className="tag-query-actions">
+            <button className="tag-query-add" type="button" onClick={addTagQuery}>
+              + Add tag
+            </button>
+          </div>
+          <p className="helper-text">
+            Multiple tag conditions are matched with AND logic. Every tag must
+            meet its minimum count.
+          </p>
+          <button className="tag-query-search" type="button" onClick={handleSearchTags}>
             Search
           </button>
         </div>
@@ -1712,7 +1976,7 @@ function App() {
       <section className="page-panel">
         <p className="eyebrow">Species tag search</p>
         <h1>Search By Species</h1>
-        <div className="form-card">
+        <div className="form-card search-form-card">
           <label>
             Species
             <input
@@ -1735,14 +1999,16 @@ function App() {
       <section className="page-panel">
         <p className="eyebrow">Oracle ML query</p>
         <h1>Search By Uploaded File</h1>
-        <div className="form-card form-card-wide">
+        <div className="form-card form-card-wide search-upload-card">
+          <h2>Select Media</h2>
           <p className="helper-text">
             Upload a query image or a small query video. Image queries are compressed before sending. 
             For video queries, the browser extracts one representative frame and sends that frame to Oracle ML. 
             The detected species tags are then used to search matching images and videos from DynamoDB.
           </p>
-          <label>
-            Query image or video
+          <label className="upload-picker">
+            <span>Choose Media Files</span>
+            <small>Images and videos are supported</small>
             <input
               type="file"
               accept="image/*,video/*"
@@ -1768,7 +2034,7 @@ function App() {
       <section className="page-panel">
         <p className="eyebrow">Thumbnail reverse lookup</p>
         <h1>Thumbnail Lookup</h1>
-        <div className="form-card form-card-wide">
+        <div className="form-card form-card-wide search-form-card">
           <label>
             Thumbnail URL
             <input
@@ -1895,11 +2161,22 @@ function App() {
           </NavButton>
         </nav>
         <button className="logout-button" type="button" onClick={handleLogout}>
-          Logout
+          <NavIcon page="logout" />
+          <span>Logout</span>
         </button>
       </aside>
 
       <main className="page-shell">
+        {currentPage !== 'dashboard' && (
+          <button
+            className="home-jump-button"
+            type="button"
+            onClick={() => navigateTo('dashboard')}
+          >
+            <NavIcon page="dashboard" />
+            <span>Home</span>
+          </button>
+        )}
         {renderCurrentPage()}
         <FullImageModal
           item={selectedResult}
@@ -1917,8 +2194,103 @@ function NavButton({ children, currentPage, page, onClick }) {
       type="button"
       onClick={() => onClick(page)}
     >
-      {children}
+      <NavIcon page={page} />
+      <span>{children}</span>
     </button>
+  )
+}
+
+function NavIcon({ page }) {
+  const common = {
+    className: 'nav-icon',
+    viewBox: '0 0 24 24',
+    fill: 'none',
+    stroke: 'currentColor',
+    strokeWidth: '2.2',
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+    'aria-hidden': 'true'
+  }
+
+  if (page === 'dashboard') {
+    return (
+      <svg {...common}>
+        <path d="M4 4h7v7H4z" />
+        <path d="M13 4h7v7h-7z" />
+        <path d="M4 13h7v7H4z" />
+        <path d="M13 13h7v7h-7z" />
+      </svg>
+    )
+  }
+
+  if (page === 'upload-media') {
+    return (
+      <svg {...common}>
+        <path d="M16 16l-4-4-4 4" />
+        <path d="M12 12v8" />
+        <path d="M20 16.5a4.5 4.5 0 0 0-3.9-6.7A6 6 0 0 0 4.8 8.2 4.5 4.5 0 0 0 5.5 17H7" />
+      </svg>
+    )
+  }
+
+  if (page === 'search-tags') {
+    return (
+      <svg {...common}>
+        <path d="M20.6 13.3 13.3 20.6a2 2 0 0 1-2.8 0L3.4 13.5A2 2 0 0 1 2.8 12V4.8a2 2 0 0 1 2-2H12a2 2 0 0 1 1.4.6l7.2 7.1a2 2 0 0 1 0 2.8Z" />
+        <path d="M7.5 7.5h.01" />
+      </svg>
+    )
+  }
+
+  if (page === 'search-species') {
+    return (
+      <svg {...common}>
+        <circle cx="6.5" cy="10" r="1.8" />
+        <circle cx="10" cy="6.8" r="1.8" />
+        <circle cx="14" cy="6.8" r="1.8" />
+        <circle cx="17.5" cy="10" r="1.8" />
+        <path d="M7.8 16.8c.9-3.4 2.4-5.1 4.2-5.1s3.3 1.7 4.2 5.1c.5 1.9-.8 3.2-2.5 2.5a4.8 4.8 0 0 0-3.4 0c-1.7.7-3-.6-2.5-2.5Z" />
+      </svg>
+    )
+  }
+
+  if (page === 'search-upload') {
+    return (
+      <svg {...common}>
+        <path d="M6 3h9l3 3v15H6z" />
+        <path d="M14 3v4h4" />
+        <circle cx="11" cy="13" r="2.4" />
+        <path d="m13 15 2.2 2.2" />
+      </svg>
+    )
+  }
+
+  if (page === 'thumbnail') {
+    return (
+      <svg {...common}>
+        <path d="M4 4h6v6H4z" />
+        <path d="M14 4h6v6h-6z" />
+        <path d="M4 14h6v6H4z" />
+        <path d="M14 14h6v6h-6z" />
+      </svg>
+    )
+  }
+
+  if (page === 'management') {
+    return (
+      <svg {...common}>
+        <circle cx="12" cy="12" r="3" />
+        <path d="M19.4 15a1.8 1.8 0 0 0 .4 2l.1.1-2.1 2.1-.1-.1a1.8 1.8 0 0 0-2-.4 1.8 1.8 0 0 0-1.1 1.7v.2h-3v-.2a1.8 1.8 0 0 0-1.2-1.7 1.8 1.8 0 0 0-2 .4l-.1.1-2.1-2.1.1-.1a1.8 1.8 0 0 0 .4-2 1.8 1.8 0 0 0-1.7-1.1h-.2v-3h.2a1.8 1.8 0 0 0 1.7-1.2 1.8 1.8 0 0 0-.4-2l-.1-.1 2.1-2.1.1.1a1.8 1.8 0 0 0 2 .4 1.8 1.8 0 0 0 1.2-1.7v-.2h3v.2a1.8 1.8 0 0 0 1.1 1.7 1.8 1.8 0 0 0 2-.4l.1-.1 2.1 2.1-.1.1a1.8 1.8 0 0 0-.4 2 1.8 1.8 0 0 0 1.7 1.2h.2v3h-.2a1.8 1.8 0 0 0-1.7 1.1Z" />
+      </svg>
+    )
+  }
+
+  return (
+    <svg {...common}>
+      <path d="M10 17H5V7h5" />
+      <path d="m15 7 5 5-5 5" />
+      <path d="M20 12H9" />
+    </svg>
   )
 }
 
