@@ -294,6 +294,16 @@ function App() {
       reader.readAsDataURL(file)
     })
 
+  const calculateFileChecksum = async (file) => {
+    const buffer = await file.arrayBuffer()
+    const hashBuffer = await crypto.subtle.digest('SHA-256', buffer)
+    const hashArray = Array.from(new Uint8Array(hashBuffer))
+
+    return hashArray
+      .map((byte) => byte.toString(16).padStart(2, '0'))
+      .join('')
+  }
+
   const extractVideoFrameToBase64 = (file) =>
     new Promise((resolve, reject) => {
       const video = document.createElement('video')
@@ -475,7 +485,7 @@ function App() {
     if (idToken) {
       headers.Authorization = `Bearer ${idToken}`
     }
-
+  
     const res = await fetch(`${API_BASE_URL}${endpoint}`, {
       method: 'POST',
       headers,
@@ -494,6 +504,19 @@ function App() {
     }
   }
 
+const checkDuplicateByChecksum = async (file) => {
+  const checksum = await calculateFileChecksum(file)
+
+  const duplicateResponse = await fetchApiData('/files/by-checksum', {
+    checksum
+  })
+
+  return {
+    checksum,
+    ...duplicateResponse
+  }
+}
+  
   const requireLogin = () => {
     if (!idToken) {
       setResponse({
@@ -957,28 +980,67 @@ function App() {
       return
     }
 
-    const isDuplicate = await checkUploadDuplicate(uploadMediaFile)
+    let duplicateCheck
 
-    if (isDuplicate) {
-      setUploadToast({
-        type: 'duplicate',
-        title: 'Duplicate detected',
-        message: 'This file has already been uploaded. Upload skipped.'
-      })
-      setPageResponse({
-        endpoint: 'Frontend duplicate check',
-        message: 'Duplicate detected, upload skipped.',
-        request: {
-          file_name: uploadMediaFile.name,
-          file_size: uploadMediaFile.size
-        },
-        duplicate: true,
-        skipped: true
-      }, responsePage)
-      setUploadMetadataStatus('idle')
-      setUploadProcessedRecord(null)
-      return
-    }
+try {
+  duplicateCheck = await checkDuplicateByChecksum(uploadMediaFile)
+} catch (error) {
+  console.error('Checksum duplicate check failed. Continuing upload.', error)
+  duplicateCheck = {
+    duplicate: false,
+    checksum: ''
+  }
+}
+
+if (duplicateCheck.duplicate) {
+  const existingFile = duplicateCheck.existing_file || {}
+
+  setUploadToast({
+    type: 'duplicate',
+    title: 'Duplicate detected',
+    message: 'This file already exists. Upload skipped.'
+  })
+
+  setPageResponse({
+    endpoint: 'Frontend checksum duplicate check',
+    message: 'Duplicate detected by SHA-256 checksum. Upload skipped.',
+    request: {
+      file_name: uploadMediaFile.name,
+      file_size: uploadMediaFile.size,
+      checksum: duplicateCheck.checksum
+    },
+    duplicate: true,
+    skipped: true,
+    existing_file: existingFile
+  }, responsePage)
+
+  setUploadProcessingResult({
+    found: true,
+    duplicate: true,
+    message: 'Duplicate detected by SHA-256 checksum.',
+    file_name: existingFile.file_name,
+    file_type: existingFile.file_type,
+    file_url: existingFile.file_url,
+    thumbnail_url: existingFile.thumbnail_url,
+    tags: existingFile.tags || {},
+    confidence: existingFile.confidence || {},
+    frames_processed: existingFile.frames_processed || 0,
+    ml_source: existingFile.ml_source || 'Existing DynamoDB record',
+    existing_file: existingFile
+  })
+
+  setUploadProcessingStatus('duplicate')
+  setUploadMetadataStatus('ready')
+  setUploadProcessedRecord(existingFile)
+  setIsUploadDetailsOpen(true)
+
+  return
+}
+
+setPageLoading(true, responsePage)
+setUploadToast(null)
+setUploadProcessingResult(null)
+setUploadProcessingStatus('processing')
 
     setPageLoading(true, responsePage)
     setUploadToast(null)
@@ -1485,7 +1547,9 @@ function App() {
       <div>
         <h3>Processing status</h3>
         <div className="upload-chip-list">
-          {hasRealMetadata ? (
+          {uploadProcessingStatus === 'duplicate' ? (
+            <span className="warning-chip">Duplicate detected</span>
+          ) : hasRealMetadata ? (
             <span>Processing complete</span>
           ) : isProcessingTimeout ? (
             <span className="warning-chip">
@@ -1500,7 +1564,12 @@ function App() {
         </div>
       </div>
 
-      {isProcessingMetadata ? (
+      {uploadProcessingStatus === 'duplicate' ? (
+        <div className="upload-processing-warning">
+      Duplicate file detected. This file already exists in DynamoDB. The upload was
+      skipped to avoid creating duplicate S3 and DynamoDB records.
+        </div>
+        ) : isProcessingMetadata ? (
         <div className="upload-loading-list" aria-live="polite">
           {[
             'Detecting species...',
