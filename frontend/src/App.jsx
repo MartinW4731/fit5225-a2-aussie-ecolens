@@ -1381,7 +1381,7 @@ setUploadProcessingStatus('processing')
                 <dd>{fileType}</dd>
               </div>
               <div>
-                <dt>S3 URL</dt>
+                <dt>Original S3 URL</dt>
                 <dd>{fileUrl}</dd>
               </div>
               <div>
