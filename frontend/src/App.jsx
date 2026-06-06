@@ -509,7 +509,7 @@ function App() {
     if (!requireLogin()) return
 
     const finalTags = tagQueries.reduce((tags, query) => {
-      const tag = query.tag.trim()
+      const tag = normaliseSpeciesTag(query.tag)
 
       if (!tag) return tags
 
@@ -568,7 +568,7 @@ function App() {
   const handleSearchSpecies = () => {
     if (!requireLogin()) return
 
-    const finalSpecies = species.trim()
+    const finalSpecies = normaliseSpeciesTag(species)
 
     if (!finalSpecies) {
       setResponse({ message: 'Please enter a species tag.' })
@@ -2735,6 +2735,13 @@ function formatFileSize(size) {
   }
 
   return `${(size / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function normaliseSpeciesTag(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '_')
 }
 
 function safeFileName(fileName) {
