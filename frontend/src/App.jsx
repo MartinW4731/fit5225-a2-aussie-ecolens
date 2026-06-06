@@ -464,6 +464,7 @@ function App() {
       if (data.found) {
         setUploadProcessingResult(data)
         setUploadProcessingStatus('completed')
+        setUploadMetadataStatus('ready')
         return data
       }
 
@@ -1130,7 +1131,7 @@ setUploadProcessingStatus('processing')
                 'Your media has been uploaded and is being processed for species detection.'
             }
       )
-      pollUploadedMediaMetadata(uploadResponse)
+      
     } catch (error) {
       console.error(error)
       setPageResponse({
@@ -1530,8 +1531,7 @@ setUploadProcessingStatus('processing')
     confidenceEntries.length > 0
 
   const isProcessingTimeout =
-    uploadProcessingStatus === 'timeout' ||
-    (uploadMetadataStatus === 'timeout' && !hasRealMetadata)
+    uploadMetadataStatus === 'timeout' && !hasRealMetadata
 
   const isProcessingMetadata = !hasRealMetadata && !isProcessingTimeout
 
