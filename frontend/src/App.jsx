@@ -33,6 +33,8 @@ function App() {
   const [queryFile, setQueryFile] = useState(null)
   const [uploadMediaFile, setUploadMediaFile] = useState(null)
   const [uploadMediaFiles, setUploadMediaFiles] = useState([])
+  const [uploadProcessingResult, setUploadProcessingResult] = useState(null)
+  const [uploadProcessingStatus, setUploadProcessingStatus] = useState('')
   const [uploadPreviewItems, setUploadPreviewItems] = useState([])
   const [uploadLightboxIndex, setUploadLightboxIndex] = useState(null)
   const [uploadToast, setUploadToast] = useState(null)
@@ -422,6 +424,48 @@ function App() {
       setPageLoading(false, responsePage)
     }
   }
+
+ const pollUploadedFileProcessingResult = async (fileUrl, maxAttempts = 10) => {
+  setUploadProcessingStatus('processing')
+  setUploadProcessingResult(null)
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 4000))
+
+      const headers = {
+        'Content-Type': 'application/json'
+      }
+
+      if (idToken) {
+        headers.Authorization = `Bearer ${idToken}`
+      }
+
+      const res = await fetch(`${API_BASE_URL}/files/by-url`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          file_url: fileUrl
+        })
+      })
+
+      const data = await res.json()
+
+      if (data.found) {
+        setUploadProcessingResult(data)
+        setUploadProcessingStatus('completed')
+        return data
+      }
+
+      setUploadProcessingStatus('processing')
+    } catch (error) {
+      console.error('Polling uploaded file result failed:', error)
+    }
+  }
+
+  setUploadProcessingStatus('timeout')
+  return null
+} 
 
   const fetchApiData = async (endpoint, payload) => {
     const headers = {
@@ -938,6 +982,8 @@ function App() {
 
     setPageLoading(true, responsePage)
     setUploadToast(null)
+    setUploadProcessingResult(null)
+    setUploadProcessingStatus('processing')
 
     try {
       const credentials = fromCognitoIdentityPool({
@@ -997,7 +1043,7 @@ function App() {
         next_step:
           'Wait a few seconds, then search by the detected species tag or check the matching results.'
       }
-
+      setResponse(uploadResponse)
       setPageResponse(uploadResponse, responsePage)
       setIsUploadDetailsOpen(false)
       setUploadedMediaSignatures((currentSignatures) => [
@@ -1006,6 +1052,8 @@ function App() {
           getUploadDuplicateKey(uploadMediaFile)
         ])
       ])
+      pollUploadedFileProcessingResult(fileUrl)
+      
       setUploadToast(
         isDuplicateUploadResponse(uploadResponse)
           ? {
@@ -1370,110 +1418,159 @@ function App() {
   }
 
   const renderUploadDetectionSummary = () => {
-    if (
-      response.endpoint !== 'Cognito Identity Pool + S3 PutObject' ||
-      response.error ||
-      isDuplicateUploadResponse(response)
-    ) {
-      return null
-    }
+  if (
+    response.endpoint !== 'Cognito Identity Pool + S3 PutObject' ||
+    response.error ||
+    isDuplicateUploadResponse(response)
+  ) {
+    return null
+  }
 
-    const speciesValues = [...new Set(getUploadSpecies().filter(Boolean))]
-    const tagEntries = getUploadTagEntries()
-    const confidenceEntries = getUploadConfidenceEntries()
-    const hasProcessedRecord = Boolean(uploadProcessedRecord)
-    const hasRealMetadata =
-      speciesValues.length > 0 || tagEntries.length > 0 || confidenceEntries.length > 0
-    const isProcessingTimeout = uploadMetadataStatus === 'timeout' && !hasRealMetadata
-    const isProcessingMetadata =
-      !hasRealMetadata && !isProcessingTimeout
-    const renderLoadingLine = (label) => (
-      <div className="upload-loading-row" key={label}>
-        <span className="upload-mini-spinner" aria-hidden="true" />
-        <span>{label}</span>
-      </div>
+  const metadataSource = uploadProcessingResult || uploadProcessedRecord || response
+
+  const tags =
+    metadataSource.tags ||
+    metadataSource.detected_tags ||
+    metadataSource.detectedTags ||
+    {}
+
+  const confidence =
+    metadataSource.confidence ||
+    metadataSource.confidence_scores ||
+    {}
+
+  const tagEntries = Object.entries(tags)
+  const confidenceEntries = Object.entries(confidence)
+
+  const speciesValues = [
+    ...new Set(
+      [
+        ...(Array.isArray(metadataSource.detected_species)
+          ? metadataSource.detected_species
+          : []),
+        ...(Array.isArray(metadataSource.species)
+          ? metadataSource.species
+          : []),
+        ...tagEntries
+          .filter(([, count]) => Number(count) > 0)
+          .map(([tag]) => tag)
+      ].filter(Boolean)
     )
+  ]
 
-    return (
-      <div className="upload-detection-card">
-        <div>
-          <h3>Processing status</h3>
-          <div className="upload-chip-list">
-            {hasRealMetadata ? (
-              <span>Processing complete</span>
-            ) : isProcessingTimeout ? (
-              <span className="warning-chip">
-                Processing is taking longer than expected.
-              </span>
-            ) : (
-              <span className="processing-chip">
-                <span className="upload-mini-spinner" aria-hidden="true" />
-                Processing wildlife detection...
-              </span>
-            )}
-          </div>
+  const hasRealMetadata =
+    Boolean(uploadProcessingResult) ||
+    speciesValues.length > 0 ||
+    tagEntries.length > 0 ||
+    confidenceEntries.length > 0
+
+  const isProcessingTimeout =
+    uploadProcessingStatus === 'timeout' ||
+    (uploadMetadataStatus === 'timeout' && !hasRealMetadata)
+
+  const isProcessingMetadata = !hasRealMetadata && !isProcessingTimeout
+
+  const framesProcessed =
+    Number(metadataSource.frames_processed || metadataSource.framesProcessed || 0)
+
+  const renderLoadingLine = (label) => (
+    <div className="upload-loading-row" key={label}>
+      <span className="upload-mini-spinner" aria-hidden="true" />
+      <span>{label}</span>
+    </div>
+  )
+
+  return (
+    <div className="upload-detection-card">
+      <div>
+        <h3>Processing status</h3>
+        <div className="upload-chip-list">
+          {hasRealMetadata ? (
+            <span>Processing complete</span>
+          ) : isProcessingTimeout ? (
+            <span className="warning-chip">
+              Processing is taking longer than expected.
+            </span>
+          ) : (
+            <span className="processing-chip">
+              <span className="upload-mini-spinner" aria-hidden="true" />
+              Processing wildlife detection...
+            </span>
+          )}
         </div>
+      </div>
 
-        {isProcessingMetadata ? (
-          <div className="upload-loading-list" aria-live="polite">
-            {[
-              'Detecting species...',
-              'Generating tags...',
-              'Calculating confidence...'
-            ].map(renderLoadingLine)}
+      {isProcessingMetadata ? (
+        <div className="upload-loading-list" aria-live="polite">
+          {[
+            'Detecting species...',
+            'Generating tags...',
+            'Calculating confidence...'
+          ].map(renderLoadingLine)}
+        </div>
+      ) : isProcessingTimeout ? (
+        <div className="upload-processing-warning">
+          Processing is taking longer than expected. Please verify the result
+          later using Search By Tags or Search By Species.
+        </div>
+      ) : (
+        <>
+          <div>
+            <h3>Detected species</h3>
+            <div className="upload-chip-list">
+              {speciesValues.length > 0 ? (
+                speciesValues.map((value) => (
+                  <span key={value}>{formatSpeciesDisplayName(value)}</span>
+                ))
+              ) : (
+                <span className="neutral-chip">No species detected</span>
+              )}
+            </div>
           </div>
-        ) : isProcessingTimeout ? (
-          <div className="upload-processing-warning">
-            Processing is taking longer than expected. Please verify the result
-            later using Search By Tags or Search By Species.
-          </div>
-        ) : (
-          <>
+
+          {framesProcessed > 0 && (
             <div>
-              <h3>Detected species</h3>
+              <h3>Frames processed</h3>
               <div className="upload-chip-list">
-                {speciesValues.length > 0 ? (
-                  speciesValues.map((value) => (
-                    <span key={value}>{formatSpeciesDisplayName(value)}</span>
-                  ))
-                ) : (
-                  [...new Set(tagEntries.map(([tag]) => tag))].map((tag) => (
-                    <span key={tag}>{formatSpeciesDisplayName(tag)}</span>
-                  ))
-                )}
+                <span>{framesProcessed}</span>
               </div>
             </div>
+          )}
 
-            <div>
-              <h3>Tags</h3>
-              <div className="upload-chip-list">
-                {tagEntries.map(([tag, count]) => (
+          <div>
+            <h3>Tags</h3>
+            <div className="upload-chip-list">
+              {tagEntries.length > 0 ? (
+                tagEntries.map(([tag, count]) => (
                   <span key={tag}>
                     {tag} ({count})
                   </span>
-                ))}
-              </div>
+                ))
+              ) : (
+                <span className="neutral-chip">No tags returned</span>
+              )}
             </div>
+          </div>
 
-            <div>
-              <h3>Confidence</h3>
-              <div className="upload-chip-list">
-                {confidenceEntries.length > 0 ? (
-                  confidenceEntries.map(([tag, value]) => (
-                    <span key={tag}>
-                      {tag}: {formatConfidenceValue(value)}
-                    </span>
-                  ))
-                ) : hasProcessedRecord ? (
-                  <span className="neutral-chip">No confidence values returned</span>
-                ) : null}
-              </div>
+          <div>
+            <h3>Confidence</h3>
+            <div className="upload-chip-list">
+              {confidenceEntries.length > 0 ? (
+                confidenceEntries.map(([tag, value]) => (
+                  <span key={tag}>
+                    {tag}: {formatConfidenceValue(value)}
+                  </span>
+                ))
+              ) : (
+                <span className="neutral-chip">No confidence values returned</span>
+              )}
             </div>
-          </>
-        )}
-      </div>
-    )
-  }
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
 
   const renderUploadLightbox = () => {
     if (uploadLightboxIndex === null || uploadPreviewItems.length === 0) {
@@ -1821,6 +1918,8 @@ function App() {
                   setUploadToast(null)
                   setUploadProcessedRecord(null)
                   setUploadMetadataStatus('idle')
+                  setUploadProcessingResult(null)
+                  setUploadProcessingStatus('')
                   setIsUploadDetailsOpen(false)
                   uploadPollIdRef.current += 1
                   setResponse(initialResponse)
