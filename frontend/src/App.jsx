@@ -1331,12 +1331,15 @@ setUploadProcessingStatus('processing')
         ? uploadedFiles.map((file) => file.file_url).join(', ')
         : response.file_url || 'Not returned'
     const processingStatus =
-      uploadMetadataStatus === 'ready'
-        ? 'Processed'
-        : uploadMetadataStatus === 'timeout'
-          ? 'Processing pending'
-          : 'Processing pending'
-
+    uploadProcessingStatus === 'duplicate'
+    ? 'Duplicate detected'
+    : uploadProcessingStatus === 'completed' ||
+        uploadMetadataStatus === 'ready' ||
+        uploadProcessingResult
+      ? 'Processed'
+      : uploadProcessingStatus === 'timeout' || uploadMetadataStatus === 'timeout'
+        ? 'Processing pending'
+        : 'Processing pending'
     return (
       <div className="upload-success-card" role="status" aria-live="polite">
         <button
