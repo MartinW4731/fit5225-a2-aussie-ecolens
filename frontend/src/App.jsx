@@ -38,10 +38,10 @@ function App() {
   const [uploadPreviewItems, setUploadPreviewItems] = useState([])
   const [uploadLightboxIndex, setUploadLightboxIndex] = useState(null)
   const [uploadToast, setUploadToast] = useState(null)
+  const [copiedValueKey, setCopiedValueKey] = useState('')
   const [uploadedMediaSignatures, setUploadedMediaSignatures] = useState([])
   const [uploadProcessedRecord, setUploadProcessedRecord] = useState(null)
   const [uploadMetadataStatus, setUploadMetadataStatus] = useState('idle')
-  const [isUploadDetailsOpen, setIsUploadDetailsOpen] = useState(false)
   const uploadPollIdRef = useRef(0)
 
   const [updateUrls, setUpdateUrls] = useState('')
@@ -242,6 +242,15 @@ function App() {
     Object.entries(tags)
       .map(([tag, count]) => `${tag} >= ${count}`)
       .join(' AND ')
+
+  const firstNonEmptyObject = (...values) =>
+    values.find(
+      (value) =>
+        value &&
+        typeof value === 'object' &&
+        !Array.isArray(value) &&
+        Object.keys(value).length > 0
+    ) || {}
 
   const compressImageToBase64 = (file, maxWidth = 800, quality = 0.75) =>
     new Promise((resolve, reject) => {
@@ -734,6 +743,28 @@ const checkDuplicateByChecksum = async (file) => {
 
   const getUploadDuplicateKey = (file) => `${file.name}|${file.size}`
 
+  const getThumbnailUrlFromFileUrl = (fileUrl) => {
+    if (!fileUrl || typeof fileUrl !== 'string' || fileUrl === 'Not returned') {
+      return ''
+    }
+
+    return fileUrl.replace('/uploads/', '/thumbnails/')
+  }
+
+  const copyValue = async (value, key) => {
+    if (!value) return
+
+    try {
+      await navigator.clipboard.writeText(value)
+      setCopiedValueKey(key)
+      window.setTimeout(() => {
+        setCopiedValueKey((currentKey) => (currentKey === key ? '' : currentKey))
+      }, 1800)
+    } catch (error) {
+      console.error('Failed to copy value.', error)
+    }
+  }
+
   const getRecordFileSize = (record) =>
     record.file_size ??
     record.fileSize ??
@@ -858,12 +889,18 @@ const checkDuplicateByChecksum = async (file) => {
           item.file?.tags ||
           {},
         confidence:
-          item.confidence ||
-          item.confidence_scores ||
-          item.media?.confidence ||
-          item.record?.confidence ||
-          item.file?.confidence ||
-          {}
+          firstNonEmptyObject(
+            item.confidence_scores,
+            item.confidenceScores,
+            item.detection_confidence,
+            item.media?.confidence_scores,
+            item.record?.confidence_scores,
+            item.file?.confidence_scores,
+            item.confidence,
+            item.media?.confidence,
+            item.record?.confidence,
+            item.file?.confidence
+          )
       }))
   }
 
@@ -995,27 +1032,28 @@ try {
 
 if (duplicateCheck.duplicate) {
   const existingFile = duplicateCheck.existing_file || {}
-
-  setUploadToast({
-    type: 'duplicate',
-    title: 'Duplicate detected',
-    message: 'This file already exists. Upload skipped.'
-  })
-
-  setPageResponse({
-    endpoint: 'Frontend checksum duplicate check',
-    message: 'Duplicate detected by SHA-256 checksum. Upload skipped.',
+  const existingConfidence = firstNonEmptyObject(
+    existingFile.confidence_scores,
+    existingFile.confidenceScores,
+    existingFile.detection_confidence,
+    existingFile.confidence
+  )
+  const duplicateDisplayResponse = {
+    endpoint: 'Cognito Identity Pool + S3 PutObject',
+    status: 200,
+    message: 'Existing media found. Showing the previous upload details.',
     request: {
-      file_name: uploadMediaFile.name,
-      file_size: uploadMediaFile.size,
-      checksum: duplicateCheck.checksum
+      file_name: existingFile.file_name || uploadMediaFile.name,
+      file_type: existingFile.file_type || uploadMediaFile.type,
+      file_size: uploadMediaFile.size
     },
-    duplicate: true,
-    skipped: true,
-    existing_file: existingFile
-  }, responsePage)
-
-  setUploadProcessingResult({
+    bucket: existingFile.bucket || S3_BUCKET,
+    key: existingFile.s3_key || existingFile.key || '',
+    file_url: existingFile.file_url || '',
+    thumbnail_url: existingFile.thumbnail_url || '',
+    existing_upload: true
+  }
+  const duplicateProcessingResult = {
     found: true,
     duplicate: true,
     message: 'Duplicate detected by SHA-256 checksum.',
@@ -1024,16 +1062,26 @@ if (duplicateCheck.duplicate) {
     file_url: existingFile.file_url,
     thumbnail_url: existingFile.thumbnail_url,
     tags: existingFile.tags || {},
-    confidence: existingFile.confidence || {},
+    confidence: existingConfidence,
+    confidence_scores: existingConfidence,
+    species: existingFile.species || [],
+    detected_species: existingFile.detected_species || existingFile.species || [],
     frames_processed: existingFile.frames_processed || 0,
     ml_source: existingFile.ml_source || 'Existing DynamoDB record',
     existing_file: existingFile
+  }
+
+  setUploadToast({
+    type: 'duplicate',
+    title: 'Duplicate detected',
+    message: 'This file already exists. Upload skipped.'
   })
 
-  setUploadProcessingStatus('duplicate')
+  setPageResponse(duplicateDisplayResponse, responsePage)
+  setUploadProcessingResult(duplicateProcessingResult)
+  setUploadProcessingStatus('completed')
   setUploadMetadataStatus('ready')
   setUploadProcessedRecord(existingFile)
-  setIsUploadDetailsOpen(true)
 
   return
 }
@@ -1108,7 +1156,6 @@ setUploadProcessingStatus('processing')
       }
       setResponse(uploadResponse)
       setPageResponse(uploadResponse, responsePage)
-      setIsUploadDetailsOpen(false)
       setUploadedMediaSignatures((currentSignatures) => [
         ...new Set([
           ...currentSignatures,
@@ -1331,6 +1378,8 @@ setUploadProcessingStatus('processing')
       uploadedFiles.length > 1
         ? uploadedFiles.map((file) => file.file_url).join(', ')
         : response.file_url || 'Not returned'
+    const thumbnailS3Url = response.thumbnail_url || getThumbnailUrlFromFileUrl(fileUrl)
+    const isExistingUploadDisplay = Boolean(response.existing_upload)
     const processingStatus =
     uploadProcessingStatus === 'duplicate'
     ? 'Duplicate detected'
@@ -1343,37 +1392,19 @@ setUploadProcessingStatus('processing')
         : 'Processing pending'
     return (
       <div className="upload-success-card" role="status" aria-live="polite">
-        <button
-          type="button"
-          className="upload-success-toggle"
-          onClick={() => setIsUploadDetailsOpen((isOpen) => !isOpen)}
-          aria-expanded={isUploadDetailsOpen}
-        >
-          <strong>Upload successful ✓</strong>
-          <span>
-            View details
-            <span
-              className={
-                isUploadDetailsOpen
-                  ? 'upload-success-chevron open'
-                  : 'upload-success-chevron'
-              }
-              aria-hidden="true"
-            >
-              ▼
-            </span>
-          </span>
-        </button>
+        <div className="upload-success-header">
+          <strong>
+            {isExistingUploadDisplay ? 'Existing upload found ✓' : 'Upload successful ✓'}
+          </strong>
+        </div>
 
-        <div
-          className={
-            isUploadDetailsOpen
-              ? 'upload-success-details open'
-              : 'upload-success-details'
-          }
-        >
+        <div className="upload-success-details">
           <div className="upload-success-details-inner">
-            <p>Upload successful. Processing has started.</p>
+            <p>
+              {isExistingUploadDisplay
+                ? 'This media already exists. Showing the previous upload details.'
+                : 'Upload successful. Processing has started.'}
+            </p>
 
             <dl className="upload-success-list">
               <div>
@@ -1386,8 +1417,48 @@ setUploadProcessingStatus('processing')
               </div>
               <div>
                 <dt>Original S3 URL</dt>
-                <dd>{fileUrl}</dd>
+                <dd>
+                  <span className="copy-row">
+                    <span>{fileUrl}</span>
+                    {fileUrl !== 'Not returned' && (
+                      <button
+                        type="button"
+                        className="copy-button"
+                        onClick={() => copyValue(fileUrl, 'original-s3-url')}
+                        aria-label="Copy original S3 URL"
+                      >
+                        {copiedValueKey === 'original-s3-url' ? 'Copied' : 'Copy'}
+                      </button>
+                    )}
+                  </span>
+                  {fileUrl !== 'Not returned' && (
+                    <span className="url-usage-note">
+                      Copy this Original S3 URL when deleting a file by URL.
+                    </span>
+                  )}
+                </dd>
               </div>
+              {thumbnailS3Url && (
+                <div>
+                  <dt>Thumbnail S3 URL</dt>
+                  <dd>
+                    <span className="copy-row">
+                      <span>{thumbnailS3Url}</span>
+                      <button
+                        type="button"
+                        className="copy-button"
+                        onClick={() => copyValue(thumbnailS3Url, 'thumbnail-s3-url')}
+                        aria-label="Copy thumbnail S3 URL"
+                      >
+                        {copiedValueKey === 'thumbnail-s3-url' ? 'Copied' : 'Copy'}
+                      </button>
+                    </span>
+                    <span className="url-usage-note">
+                      Copy this Thumbnail S3 URL for Thumbnail Lookup queries.
+                    </span>
+                  </dd>
+                </div>
+              )}
               <div>
                 <dt>Processing status</dt>
                 <dd>{processingStatus}</dd>
@@ -1395,8 +1466,8 @@ setUploadProcessingStatus('processing')
             </dl>
 
             <p>
-              Wait a few seconds, then verify this file using Search By Species or
-              Search By Tags.
+              Copy the thumbnail URL and paste it into Thumbnail Lookup to view
+              the thumbnail and original media.
             </p>
           </div>
         </div>
@@ -1470,17 +1541,76 @@ setUploadProcessingStatus('processing')
 
   const getUploadConfidenceEntries = () => {
     const metadataSource = uploadProcessedRecord || response
-    const confidence = metadataSource.confidence || metadataSource.confidence_scores || {}
-
-    if (!confidence || typeof confidence !== 'object' || Array.isArray(confidence)) {
-      return []
-    }
+    const confidence = firstNonEmptyObject(
+      metadataSource.confidence_scores,
+      metadataSource.confidenceScores,
+      metadataSource.detection_confidence,
+      metadataSource.ml_confidence,
+      metadataSource.scores,
+      metadataSource.confidence
+    )
 
     return Object.entries(confidence)
   }
 
   const formatConfidenceValue = (value) => {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const nestedValue =
+        value.score ??
+        value.confidence ??
+        value.probability ??
+        value.value
+
+      if (nestedValue !== undefined) {
+        return String(nestedValue)
+      }
+
+      return JSON.stringify(value)
+    }
+
     return String(value)
+  }
+
+  const getConfidenceNumber = (value) => {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const nestedValue =
+        value.score ??
+        value.confidence ??
+        value.probability ??
+        value.value
+
+      return Number(nestedValue)
+    }
+
+    return Number(value)
+  }
+
+  const getConfidenceChipClass = (value) => {
+    const confidenceNumber = getConfidenceNumber(value)
+
+    if (!Number.isFinite(confidenceNumber)) {
+      return 'confidence-chip confidence-chip-unknown'
+    }
+
+    if (confidenceNumber >= 0.9) {
+      return 'confidence-chip confidence-chip-high'
+    }
+
+    if (confidenceNumber >= 0.5) {
+      return 'confidence-chip confidence-chip-medium'
+    }
+
+    return 'confidence-chip confidence-chip-low'
+  }
+
+  const formatTagCount = (count) => {
+    const numericCount = Number(count)
+
+    if (Number.isFinite(numericCount)) {
+      return String(numericCount)
+    }
+
+    return String(count || 1)
   }
 
   const renderUploadDetectionSummary = () => {
@@ -1500,10 +1630,20 @@ setUploadProcessingStatus('processing')
     metadataSource.detectedTags ||
     {}
 
-  const confidence =
-    metadataSource.confidence ||
-    metadataSource.confidence_scores ||
-    {}
+  const confidence = firstNonEmptyObject(
+    metadataSource.confidence_scores,
+    metadataSource.confidenceScores,
+    metadataSource.detection_confidence,
+    metadataSource.ml_confidence,
+    metadataSource.scores,
+    metadataSource.confidence,
+    metadataSource.result?.confidence_scores,
+    metadataSource.result?.confidence,
+    metadataSource.record?.confidence_scores,
+    metadataSource.record?.confidence,
+    metadataSource.media?.confidence_scores,
+    metadataSource.media?.confidence
+  )
 
   const tagEntries = Object.entries(tags)
   const confidenceEntries = Object.entries(confidence)
@@ -1549,7 +1689,7 @@ setUploadProcessingStatus('processing')
     <div className="upload-detection-card">
       <div>
         <h3>Processing status</h3>
-        <div className="upload-chip-list">
+        <div className="upload-chip-list upload-status-chip-list">
           {uploadProcessingStatus === 'duplicate' ? (
             <span className="warning-chip">Duplicate detected</span>
           ) : hasRealMetadata ? (
@@ -1591,9 +1731,24 @@ setUploadProcessingStatus('processing')
             <h3>Detected species</h3>
             <div className="upload-chip-list">
               {speciesValues.length > 0 ? (
-                speciesValues.map((value) => (
-                  <span key={value}>{formatSpeciesDisplayName(value)}</span>
-                ))
+                speciesValues.map((value) => {
+                  const speciesName = formatSpeciesDisplayName(value)
+                  const speciesCopyKey = `species-${value}`
+
+                  return (
+                    <span className="copy-chip" key={value}>
+                      {speciesName}
+                      <button
+                        type="button"
+                        className="chip-copy-button"
+                        onClick={() => copyValue(speciesName, speciesCopyKey)}
+                        aria-label={`Copy species ${speciesName}`}
+                      >
+                        {copiedValueKey === speciesCopyKey ? 'Copied' : 'Copy'}
+                      </button>
+                    </span>
+                  )
+                })
               ) : (
                 <span className="neutral-chip">No species detected</span>
               )}
@@ -1611,12 +1766,31 @@ setUploadProcessingStatus('processing')
 
           <div>
             <h3>Tags</h3>
-            <div className="upload-chip-list">
+            <div className="upload-tag-detail-list">
               {tagEntries.length > 0 ? (
                 tagEntries.map(([tag, count]) => (
-                  <span key={tag}>
-                    {tag} ({count})
-                  </span>
+                  <div className="upload-tag-detail" key={tag}>
+                    <div className="upload-chip-list">
+                      <span className="copy-chip">
+                        <strong>Tag</strong>
+                        {tag}
+                        <button
+                          type="button"
+                          className="chip-copy-button"
+                          onClick={() => copyValue(tag, `tag-${tag}`)}
+                          aria-label={`Copy tag ${tag}`}
+                        >
+                          {copiedValueKey === `tag-${tag}` ? 'Copied' : 'Copy'}
+                        </button>
+                      </span>
+                    </div>
+                    <div className="upload-chip-list">
+                      <span>
+                        <strong>Count</strong>
+                        {formatTagCount(count)}
+                      </span>
+                    </div>
+                  </div>
                 ))
               ) : (
                 <span className="neutral-chip">No tags returned</span>
@@ -1629,7 +1803,7 @@ setUploadProcessingStatus('processing')
             <div className="upload-chip-list">
               {confidenceEntries.length > 0 ? (
                 confidenceEntries.map(([tag, value]) => (
-                  <span key={tag}>
+                  <span className={getConfidenceChipClass(value)} key={tag}>
                     {tag}: {formatConfidenceValue(value)}
                   </span>
                 ))
@@ -1637,6 +1811,22 @@ setUploadProcessingStatus('processing')
                 <span className="neutral-chip">No confidence values returned</span>
               )}
             </div>
+            {confidenceEntries.length > 0 && (
+              <div className="confidence-legend" aria-label="Confidence color guide">
+                <span>
+                  <i className="confidence-dot confidence-dot-high" />
+                  ≥ 0.9 high match
+                </span>
+                <span>
+                  <i className="confidence-dot confidence-dot-medium" />
+                  0.5-0.9 possible mismatch
+                </span>
+                <span>
+                  <i className="confidence-dot confidence-dot-low" />
+                  &lt; 0.5 likely incorrect
+                </span>
+              </div>
+            )}
           </div>
         </>
       )}
@@ -1997,7 +2187,6 @@ setUploadProcessingStatus('processing')
                   setUploadMetadataStatus('idle')
                   setUploadProcessingResult(null)
                   setUploadProcessingStatus('')
-                  setIsUploadDetailsOpen(false)
                   uploadPollIdRef.current += 1
                   setResponse(initialResponse)
                 }}
@@ -2192,9 +2381,11 @@ setUploadProcessingStatus('processing')
             />
           </label>
           {queryFile && (
-            <p className="helper-text">
-              Selected: {queryFile.name} ({Math.round(queryFile.size / 1024)} KB)
-            </p>
+            <div className="selected-query-media" role="status" aria-live="polite">
+              <span>Selected media</span>
+              <strong>{queryFile.name}</strong>
+              <small>{Math.round(queryFile.size / 1024)} KB</small>
+            </div>
           )}
           <button type="button" onClick={handleSearchByUploadedFile}>
             Search Similar Media
@@ -2233,9 +2424,12 @@ setUploadProcessingStatus('processing')
       <section className="page-panel">
         <p className="eyebrow">Media record operations</p>
         <h1>Management</h1>
+        <p className="management-url-note">
+          Use Original S3 URL values only for all URL inputs on this page.
+        </p>
         <div className="management-grid">
           <div className="form-card">
-            <h2>Update Tags</h2>
+            <h2>Modify / Delete Tags</h2>
             <label>
               URLs
               <textarea
@@ -2533,7 +2727,14 @@ function ResultCard({ item, onPreview }) {
         {item.file_type === 'video' && (
           <div className="video-label">
             <strong>Video file</strong>
-            <span>{fullFileUrl || 'No video URL returned'}</span>
+            {fullFileUrl ? (
+              <details className="video-url-details">
+                <summary>Show video URL</summary>
+                <span>{fullFileUrl}</span>
+              </details>
+            ) : (
+              <span>No video URL returned</span>
+            )}
             <span>Frames: {item.frames_processed || 0}</span>
           </div>
         )}
@@ -2650,10 +2851,13 @@ function UpdateSummary({ response }) {
     ? response.updated_items
     : []
   const operationLabel = response.operation === 1 ? 'Add' : 'Remove'
+  const updatedCount = response.updated_count ?? updatedItems.length ?? 0
 
   return (
-    <div className="summary-card">
-      <strong>{response.message || 'Tag update completed.'}</strong>
+    <div className="summary-card management-success-summary">
+      <strong>
+        You successfully modified {updatedCount} file{updatedCount === 1 ? '' : 's'}.
+      </strong>
       <dl className="summary-list">
         <div>
           <dt>Operation</dt>
@@ -2661,31 +2865,35 @@ function UpdateSummary({ response }) {
         </div>
         <div>
           <dt>Updated count</dt>
-          <dd>{response.updated_count ?? updatedItems.length ?? 0}</dd>
+          <dd>{updatedCount}</dd>
         </div>
       </dl>
-      {updatedItems.length > 0 && (
-        <div>
-          <p className="summary-label">Updated media</p>
-          <ul className="url-list">
-            {updatedItems.map((item, index) => (
-              <li key={item.file_id || item.file_url || index}>
-                {item.file_url || item.thumbnail_url || item.file_name || item.file_id}
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-      {Array.isArray(response.not_found) && response.not_found.length > 0 && (
-        <div>
-          <p className="summary-label">Not found</p>
-          <ul className="url-list">
-            {response.not_found.map((url) => (
-              <li key={url}>{url}</li>
-            ))}
-          </ul>
-        </div>
-      )}
+      <details className="technical-response-details">
+        <summary>Technical response details</summary>
+        {updatedItems.length > 0 && (
+          <div>
+            <p className="summary-label">Updated media</p>
+            <ul className="url-list">
+              {updatedItems.map((item, index) => (
+                <li key={item.file_id || item.file_url || index}>
+                  {item.file_url || item.thumbnail_url || item.file_name || item.file_id}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {Array.isArray(response.not_found) && response.not_found.length > 0 && (
+          <div>
+            <p className="summary-label">Not found</p>
+            <ul className="url-list">
+              {response.not_found.map((url) => (
+                <li key={url}>{url}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+        <pre className="response-pre">{JSON.stringify(response, null, 2)}</pre>
+      </details>
     </div>
   )
 }
@@ -2694,53 +2902,60 @@ function DeleteSummary({ response }) {
   const deletedItems = Array.isArray(response.deleted_items)
     ? response.deleted_items
     : []
+  const deletedCount = response.deleted_count ?? deletedItems.length ?? 0
 
   return (
-    <div className="summary-card delete-summary">
-      <strong>{response.message || 'Delete operation completed.'}</strong>
+    <div className="summary-card management-success-summary">
+      <strong>
+        You successfully deleted {deletedCount} file{deletedCount === 1 ? '' : 's'}.
+      </strong>
       <dl className="summary-list">
         <div>
           <dt>Deleted count</dt>
-          <dd>{response.deleted_count ?? deletedItems.length ?? 0}</dd>
+          <dd>{deletedCount}</dd>
         </div>
       </dl>
-      {deletedItems.length > 0 && (
-        <div>
-          <p className="summary-label">Deleted media</p>
-          <ul className="url-list">
-            {deletedItems.map((item, index) => (
-              <li key={item.file_id || index}>
-                {item.file_name || item.file_id}
-                {Array.isArray(item.deleted_s3_objects) &&
-                  item.deleted_s3_objects.length > 0 &&
-                  ` — ${item.deleted_s3_objects.join(', ')}`}
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-      {Array.isArray(response.not_found) && response.not_found.length > 0 && (
-        <div>
-          <p className="summary-label">Not found</p>
-          <ul className="url-list">
-            {response.not_found.map((url) => (
-              <li key={url}>{url}</li>
-            ))}
-          </ul>
-        </div>
-      )}
-      {Array.isArray(response.errors) && response.errors.length > 0 && (
-        <div>
-          <p className="summary-label">Errors</p>
-          <ul className="url-list">
-            {response.errors.map((error, index) => (
-              <li key={`${error.url || 'error'}-${index}`}>
-                {error.url || 'Unknown URL'}: {error.error || JSON.stringify(error)}
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
+      <details className="technical-response-details">
+        <summary>Technical response details</summary>
+        {deletedItems.length > 0 && (
+          <div>
+            <p className="summary-label">Deleted media</p>
+            <ul className="url-list">
+              {deletedItems.map((item, index) => (
+                <li key={item.file_id || index}>
+                  {item.file_name || item.file_id}
+                  {Array.isArray(item.deleted_s3_objects) &&
+                    item.deleted_s3_objects.length > 0 &&
+                    ` — ${item.deleted_s3_objects.join(', ')}`}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {Array.isArray(response.not_found) && response.not_found.length > 0 && (
+          <div>
+            <p className="summary-label">Not found</p>
+            <ul className="url-list">
+              {response.not_found.map((url) => (
+                <li key={url}>{url}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {Array.isArray(response.errors) && response.errors.length > 0 && (
+          <div>
+            <p className="summary-label">Errors</p>
+            <ul className="url-list">
+              {response.errors.map((error, index) => (
+                <li key={`${error.url || 'error'}-${index}`}>
+                  {error.url || 'Unknown URL'}: {error.error || JSON.stringify(error)}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        <pre className="response-pre">{JSON.stringify(response, null, 2)}</pre>
+      </details>
     </div>
   )
 }
