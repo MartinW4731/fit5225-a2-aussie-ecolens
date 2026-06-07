@@ -1,0 +1,12 @@
+Flask
+gunicorn
+Pillow
+torch
+torchvision
+onnx2torch
+megadetector
+PyYAML
+numpy
+tqdm
+opencv-python-headless
+matplotlib
