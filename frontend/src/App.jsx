@@ -88,6 +88,10 @@ function App() {
     }
   })
 
+  const [notificationEmail, setNotificationEmail] = useState('')
+  const [notificationTagInput, setNotificationTagInput] = useState('')
+  const [notificationTags, setNotificationTags] = useState([])
+
   const isAuthenticated = Boolean(idToken)
 
   const cognitoLoginUrl = useMemo(() => {
@@ -151,6 +155,12 @@ function App() {
 
     window.history.replaceState({}, document.title, window.location.pathname)
   }, [])
+
+  useEffect(() => {
+    if (authUser?.email && !notificationEmail) {
+      setNotificationEmail(authUser.email)
+    }
+  }, [authUser, notificationEmail])
 
   useEffect(() => {
     if (uploadMediaFiles.length === 0) {
@@ -2008,6 +2018,27 @@ setUploadProcessingStatus('processing')
 
     if (response.endpoint === 'Cognito Identity Pool + S3 PutObject') return null
 
+    if (response.endpoint === '/notifications/subscribe') {
+      const savedTags = response.subscribed_tags || []
+      const snsStatus = response.sns_result?.status || 'not returned'
+      const filterPolicy = response.sns_result?.filter_policy
+
+      return (
+        <div className="summary-card notification-success-summary">
+          <strong>Notification preferences saved.</strong>
+          <span>
+            SNS status: {snsStatus}.
+            {snsStatus === 'subscription_created' &&
+              ' Please confirm the SNS subscription email, then save again to activate the filter policy.'}
+          </span>
+          <span>Watched tags: {savedTags.length > 0 ? savedTags.join(', ') : 'none'}</span>
+          {filterPolicy && (
+            <span>SNS filter policy: {JSON.stringify(filterPolicy)}</span>
+          )}
+        </div>
+      )
+    }
+
     if (response.endpoint === '/query/by-upload' && response.detected_tags) {
   const resultCount = Array.isArray(response.results) ? response.results.length : 0
 
@@ -2058,6 +2089,71 @@ setUploadProcessingStatus('processing')
   const navigateTo = (page) => {
     setCurrentPage(page)
     setSelectedResult(null)
+  }
+
+
+  const addNotificationTag = () => {
+    const cleanTag = normaliseSpeciesTag(notificationTagInput)
+
+    if (!cleanTag) return
+
+    setNotificationTags((currentTags) =>
+      currentTags.includes(cleanTag) ? currentTags : [...currentTags, cleanTag]
+    )
+    setNotificationTagInput('')
+  }
+
+  const removeNotificationTag = (tagToRemove) => {
+    setNotificationTags((currentTags) =>
+      currentTags.filter((tag) => tag !== tagToRemove)
+    )
+  }
+
+  const submitNotificationPreferences = async (tagsToSave = notificationTags) => {
+    if (!requireLogin()) return
+
+    const responsePage = 'notifications'
+    const cleanEmail = notificationEmail.trim()
+    const cleanTags = tagsToSave
+      .map((tag) => normaliseSpeciesTag(tag))
+      .filter(Boolean)
+      .filter((tag, index, tags) => tags.indexOf(tag) === index)
+
+    if (!cleanEmail) {
+      setPageResponse({ message: 'Please enter an email address.' }, responsePage)
+      return
+    }
+
+    setNotificationTags(cleanTags)
+    setPageLoading(true, responsePage)
+
+    const payload = {
+      user_email: cleanEmail,
+      subscribed_tags: cleanTags
+    }
+
+    try {
+      const data = await fetchApiData('/notifications/subscribe', payload)
+
+      setPageResponse({
+        endpoint: '/notifications/subscribe',
+        request: payload,
+        ...data
+      }, responsePage)
+    } catch (error) {
+      setPageResponse({
+        endpoint: '/notifications/subscribe',
+        request: payload,
+        message: 'Notification preference update failed',
+        error: String(error)
+      }, responsePage)
+    } finally {
+      setPageLoading(false, responsePage)
+    }
+  }
+
+  const unsubscribeAllNotifications = () => {
+    submitNotificationPreferences([])
   }
 
   const handleSignIn = () => {
@@ -2151,6 +2247,10 @@ setUploadProcessingStatus('processing')
         <button type="button" className="dashboard-card" onClick={() => navigateTo('thumbnail')}>
           <span>Thumbnail Lookup</span>
           <p>Resolve a thumbnail URL back to its original media record.</p>
+        </button>
+        <button type="button" className="dashboard-card" onClick={() => navigateTo('notifications')}>
+          <span>Notification Settings</span>
+          <p>Choose watched species tags and receive matching email alerts.</p>
         </button>
         <button type="button" className="dashboard-card" onClick={() => navigateTo('management')}>
           <span>Management</span>
@@ -2419,6 +2519,100 @@ setUploadProcessingStatus('processing')
     </>
   )
 
+
+  const renderNotificationPage = () => (
+    <>
+      <section className="page-panel">
+        <p className="eyebrow">Tag-based email alerts</p>
+        <h1>Notification Settings</h1>
+        <p className="page-subtitle">
+          Enter species tags you want to monitor. The saved tags are stored in
+          DynamoDB and synced with the SNS subscription filter policy.
+        </p>
+
+        <div className="form-card notification-settings-card">
+          <label>
+            Email address
+            <input
+              type="email"
+              value={notificationEmail}
+              onChange={(event) => setNotificationEmail(event.target.value)}
+              placeholder="your.email@example.com"
+            />
+          </label>
+
+          <div className="notification-add-row">
+            <label>
+              Add watched species tag
+              <input
+                value={notificationTagInput}
+                onChange={(event) => setNotificationTagInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault()
+                    addNotificationTag()
+                  }
+                }}
+                placeholder="bos_taurus"
+              />
+            </label>
+            <button type="button" onClick={addNotificationTag}>
+              Add Tag
+            </button>
+          </div>
+
+          <div className="notification-tags-panel">
+            <strong>Current watched tags</strong>
+            {notificationTags.length > 0 ? (
+              <div className="notification-tag-list">
+                {notificationTags.map((tag) => (
+                  <button
+                    className="notification-tag-chip"
+                    type="button"
+                    key={tag}
+                    onClick={() => removeNotificationTag(tag)}
+                    aria-label={`Remove ${tag}`}
+                  >
+                    {tag} <span>×</span>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <p className="helper-text">
+                No watched tags selected. Add a species tag such as bos_taurus,
+                sus_scrofa, or canis_familiaris.
+              </p>
+            )}
+          </div>
+
+          <div className="notification-actions">
+            <button
+              type="button"
+              onClick={() => submitNotificationPreferences()}
+              disabled={loading}
+            >
+              Save Notification Tags
+            </button>
+            <button
+              className="danger"
+              type="button"
+              onClick={unsubscribeAllNotifications}
+              disabled={loading}
+            >
+              Unsubscribe All
+            </button>
+          </div>
+
+          <p className="helper-text">
+            First-time SNS subscribers must confirm the AWS SNS email. After
+            confirmation, save again to apply the species_tag filter policy.
+          </p>
+        </div>
+      </section>
+      {renderResponsePanel()}
+    </>
+  )
+
   const renderManagementPage = () => (
     <>
       <section className="page-panel">
@@ -2490,6 +2684,7 @@ setUploadProcessingStatus('processing')
     if (currentPage === 'upload-media') return renderUploadMediaPage()
     if (currentPage === 'search-upload') return renderSearchUploadPage()
     if (currentPage === 'thumbnail') return renderThumbnailPage()
+    if (currentPage === 'notifications') return renderNotificationPage()
     if (currentPage === 'management') return renderManagementPage()
 
     return renderDashboard()
@@ -2525,6 +2720,9 @@ setUploadProcessingStatus('processing')
           </NavButton>
           <NavButton currentPage={currentPage} page="thumbnail" onClick={navigateTo}>
             Thumbnail Lookup
+          </NavButton>
+          <NavButton currentPage={currentPage} page="notifications" onClick={navigateTo}>
+            Notification Settings
           </NavButton>
           <NavButton currentPage={currentPage} page="management" onClick={navigateTo}>
             Management
@@ -2642,6 +2840,16 @@ function NavIcon({ page }) {
         <path d="M14 4h6v6h-6z" />
         <path d="M4 14h6v6H4z" />
         <path d="M14 14h6v6h-6z" />
+      </svg>
+    )
+  }
+
+  if (page === 'notifications') {
+    return (
+      <svg {...common}>
+        <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9" />
+        <path d="M10 21h4" />
+        <path d="M12 3v2" />
       </svg>
     )
   }
