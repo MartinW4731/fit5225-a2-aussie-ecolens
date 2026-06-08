@@ -1,0 +1,107 @@
+import json
+import boto3
+import re
+import uuid
+from urllib.parse import quote
+
+s3 = boto3.client("s3")
+
+BUCKET_NAME = "fit5225-a2-aussie-ecolens-media-group157"
+UPLOAD_PREFIX = "uploads/"
+
+
+def safe_file_name(file_name):
+    if not file_name:
+        return f"upload-{uuid.uuid4()}"
+
+    # Keep letters, numbers, dot, dash, underscore.
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", file_name)
+
+    if not cleaned:
+        cleaned = f"upload-{uuid.uuid4()}"
+
+    return cleaned
+
+
+def lambda_handler(event, context):
+    print("Received event:")
+    print(json.dumps(event, indent=2))
+
+    try:
+        if "body" in event and event["body"]:
+            body = json.loads(event["body"])
+        else:
+            body = event
+
+        file_name = safe_file_name(body.get("file_name"))
+        file_type = body.get("file_type") or "application/octet-stream"
+
+        allowed_prefixes = [
+            "image/",
+            "video/"
+        ]
+
+        if not any(file_type.startswith(prefix) for prefix in allowed_prefixes):
+            return {
+                "statusCode": 400,
+                "headers": {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Headers": "Content-Type",
+                    "Access-Control-Allow-Methods": "POST,OPTIONS"
+                },
+                "body": json.dumps({
+                    "message": "Only image and video files are supported.",
+                    "file_type": file_type
+                })
+            }
+
+        # Add short UUID prefix to avoid accidental filename overwrite.
+        object_key = f"{UPLOAD_PREFIX}{uuid.uuid4().hex[:8]}-{file_name}"
+
+        upload_url = s3.generate_presigned_url(
+            ClientMethod="put_object",
+            Params={
+                "Bucket": BUCKET_NAME,
+                "Key": object_key,
+                "ContentType": file_type
+            },
+            ExpiresIn=900
+        )
+
+        file_url = f"s3://{BUCKET_NAME}/{object_key}"
+
+        return {
+            "statusCode": 200,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type",
+                "Access-Control-Allow-Methods": "POST,OPTIONS"
+            },
+            "body": json.dumps({
+                "message": "Presigned upload URL generated successfully.",
+                "bucket": BUCKET_NAME,
+                "key": object_key,
+                "file_url": file_url,
+                "upload_url": upload_url,
+                "expires_in_seconds": 900
+            })
+        }
+
+    except Exception as e:
+        print("Error:", str(e))
+
+        return {
+            "statusCode": 500,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type",
+                "Access-Control-Allow-Methods": "POST,OPTIONS"
+            },
+            "body": json.dumps({
+                "message": "Failed to generate upload URL.",
+                "error": str(e)
+            })
+        }
