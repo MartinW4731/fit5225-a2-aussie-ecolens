@@ -32,6 +32,10 @@ function App() {
   const [queryFile, setQueryFile] = useState(null)
   const [uploadMediaFile, setUploadMediaFile] = useState(null)
   const [uploadPreviewUrl, setUploadPreviewUrl] = useState('')
+  const [uploadResponse, setUploadResponse] = useState(null)
+  const [uploadProcessingResult, setUploadProcessingResult] = useState(null)
+  const [uploadProcessingStatus, setUploadProcessingStatus] = useState('idle')
+  const [uploadProcessingError, setUploadProcessingError] = useState('')
 
   const [updateUrls, setUpdateUrls] = useState('')
   const [updateTags, setUpdateTags] = useState('')
@@ -225,6 +229,10 @@ function App() {
 
   const callApi = async (endpoint, payload) => {
     setLoading(true)
+    setUploadResponse(null)
+    setUploadProcessingResult(null)
+    setUploadProcessingStatus('idle')
+    setUploadProcessingError('')
 
     try {
       const headers = {
@@ -259,6 +267,55 @@ function App() {
     } finally {
       setLoading(false)
     }
+  }
+
+  const fetchApiData = async (endpoint, payload) => {
+    const headers = {
+      'Content-Type': 'application/json'
+    }
+
+    if (idToken) {
+      headers.Authorization = `Bearer ${idToken}`
+    }
+
+    const res = await fetch(`${API_BASE_URL}${endpoint}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    })
+
+    const data = await res.json()
+
+    if (!res.ok) {
+      throw new Error(data.error || data.message || `Request failed with status ${res.status}`)
+    }
+
+    return data
+  }
+
+  const pollUploadedFileProcessingResult = async (fileUrl, maxAttempts = 25) => {
+    setUploadProcessingStatus('processing')
+    setUploadProcessingError('')
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        const data = await fetchApiData('/files/by-url', { file_url: fileUrl })
+
+        if (data.found) {
+          setUploadProcessingResult(data)
+          setUploadProcessingStatus('completed')
+          return data
+        }
+      } catch (error) {
+        console.error('Upload processing polling failed:', error)
+        setUploadProcessingError(String(error))
+      }
+
+      await wait(4000)
+    }
+
+    setUploadProcessingStatus('timeout')
+    return null
   }
 
   const requireLogin = () => {
@@ -469,11 +526,11 @@ function App() {
 
       await s3Client.send(command)
 
-      setResponse({
+      const uploadDetails = {
         endpoint: 'Cognito Identity Pool + S3 PutObject',
         status: 200,
         message:
-          'Media uploaded to S3 successfully using Cognito temporary AWS credentials. The S3 trigger will process it with Lambda and Oracle ML shortly.',
+          'Media uploaded to S3 successfully using Cognito temporary AWS credentials. Backend processing has started.',
         request: {
           file_name: uploadMediaFile.name,
           file_type: uploadMediaFile.type,
@@ -488,10 +545,18 @@ function App() {
         bucket: S3_BUCKET,
         key: objectKey,
         file_url: fileUrl,
+        original_s3_url: fileUrl,
+        processing_status: 'processing',
         next_step:
-          'Wait a few seconds, then search by the detected species tag or check the matching results.'
-      })
+          'The frontend is now polling /files/by-url until DynamoDB metadata is ready.'
+      }
+
+      setUploadResponse(uploadDetails)
+      setResponse(uploadDetails)
+      pollUploadedFileProcessingResult(fileUrl)
     } catch (error) {
+      setUploadProcessingStatus('error')
+      setUploadProcessingError(String(error))
       setResponse({
         endpoint: 'Cognito Identity Pool + S3 PutObject',
         message: 'S3 upload failed',
@@ -953,6 +1018,164 @@ function App() {
     </section>
   )
 
+  const renderUploadSuccessCard = () => {
+    const details = uploadResponse || response
+    const result = uploadProcessingResult || {}
+
+    if (!uploadResponse) {
+      return (
+        <div className="upload-placeholder-card">
+          <h2>Upload Details</h2>
+          <p>
+            After a successful upload, this panel will show the original S3 URL,
+            processing status, and backend metadata returned from DynamoDB.
+          </p>
+        </div>
+      )
+    }
+
+    const processingStatus =
+      uploadProcessingStatus === 'completed' || uploadProcessingResult
+        ? 'Processed'
+        : uploadProcessingStatus === 'timeout'
+          ? 'Processing timeout'
+          : uploadProcessingStatus === 'error'
+            ? 'Upload failed'
+            : 'Processing pending'
+
+    return (
+      <div className="upload-success-card">
+        <div className="upload-success-header">
+          <strong>Upload Successful</strong>
+        </div>
+        <div className="upload-success-details">
+          <div className="upload-success-details-inner">
+            <dl className="upload-success-list">
+              <div>
+                <dt>File name</dt>
+                <dd>{details.request?.file_name || result.file_name || 'Uploaded media'}</dd>
+              </div>
+              <div>
+                <dt>Original S3 URL</dt>
+                <dd>
+                  <span>{details.file_url || result.file_url || 'Waiting for upload result'}</span>
+                </dd>
+              </div>
+              <div>
+                <dt>Processing</dt>
+                <dd>{processingStatus}</dd>
+              </div>
+              {result.thumbnail_url && (
+                <div>
+                  <dt>Thumbnail URL</dt>
+                  <dd>{result.thumbnail_url}</dd>
+                </div>
+              )}
+              {typeof result.frames_processed !== 'undefined' && (
+                <div>
+                  <dt>Frames</dt>
+                  <dd>{result.frames_processed}</dd>
+                </div>
+              )}
+            </dl>
+
+            <p>
+              Original media is stored in S3 uploads/. Generated metadata is stored
+              in DynamoDB after the upload-handler Lambda completes processing.
+            </p>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  const renderUploadDetectionSummary = () => {
+    const tags = uploadProcessingResult?.tags || {}
+    const confidence = uploadProcessingResult?.confidence || {}
+    const hasTags = Object.keys(tags).length > 0
+    const isProcessing = uploadProcessingStatus === 'processing'
+    const isProcessingTimeout = uploadProcessingStatus === 'timeout' && !hasTags
+
+    if (!uploadResponse && !isProcessing) {
+      return (
+        <div className="upload-placeholder-card">
+          <h2>Processing Status</h2>
+          <p>
+            Upload a file to start the S3 event workflow. This area will show
+            checksum, Oracle ML, DynamoDB, and notification status updates.
+          </p>
+        </div>
+      )
+    }
+
+    return (
+      <div className="upload-detection-card">
+        <h3>Backend Processing Status</h3>
+
+        <div className="upload-chip-list upload-status-chip-list">
+          {uploadResponse && <span className="neutral-chip">S3 upload complete</span>}
+          {isProcessing && <span className="processing-chip"><span className="upload-mini-spinner" /> Processing with Lambda + Oracle ML</span>}
+          {uploadProcessingStatus === 'completed' && <span>Processing complete</span>}
+          {uploadProcessingStatus === 'error' && <span className="warning-chip">Upload failed</span>}
+          {isProcessingTimeout && <span className="warning-chip">Processing is taking longer than expected</span>}
+        </div>
+
+        {isProcessing && (
+          <div className="upload-loading-list">
+            <div className="upload-loading-row">
+              <span className="upload-mini-spinner" /> Waiting for DynamoDB metadata through /files/by-url
+            </div>
+            <div className="upload-loading-row">
+              <span className="upload-mini-spinner" /> Image/video may still be running through Oracle ML
+            </div>
+          </div>
+        )}
+
+        {isProcessingTimeout && (
+          <div className="upload-processing-warning">
+            The file was uploaded successfully, but metadata was not returned before
+            the polling timeout. This can happen for large videos or slow Oracle ML processing.
+          </div>
+        )}
+
+        {uploadProcessingError && uploadProcessingStatus !== 'completed' && (
+          <div className="upload-processing-warning">{uploadProcessingError}</div>
+        )}
+
+        {hasTags && (
+          <div className="upload-tag-detail-list">
+            <div className="upload-tag-detail">
+              <strong>Detected species tags</strong>
+              <div className="upload-chip-list">
+                {Object.entries(tags).map(([tag, count]) => (
+                  <span key={tag}>{formatSpeciesDisplayName(tag)} · tag: {tag} · count: {String(count)}</span>
+                ))}
+              </div>
+            </div>
+
+            {Object.keys(confidence).length > 0 && (
+              <div className="upload-tag-detail">
+                <strong>Confidence scores</strong>
+                <div className="upload-chip-list">
+                  {Object.entries(confidence).map(([tag, score]) => (
+                    <span key={tag} className={getConfidenceChipClass(score)}>
+                      {tag}: {formatConfidence(score)}
+                    </span>
+                  ))}
+                </div>
+                <div className="confidence-legend">
+                  <span><span className="confidence-dot confidence-dot-high" /> High</span>
+                  <span><span className="confidence-dot confidence-dot-medium" /> Medium</span>
+                  <span><span className="confidence-dot confidence-dot-low" /> Low</span>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    )
+  }
+
   const renderUploadMediaPage = () => (
     <>
       <section className="page-panel">
@@ -962,20 +1185,13 @@ function App() {
           Add images or videos into the media database for future search.
         </p>
 
-        <div className="notice-card">
-          <strong>Upload Media uses Cognito Identity Pool temporary AWS credentials.</strong>
-          <span>
-            After upload, the existing S3 trigger processes the file, calls Oracle
-            ML, creates metadata, and stores the record in DynamoDB.
-          </span>
-        </div>
-
         <div className="upload-layout">
           <div className="form-card form-card-wide">
             <h2>Select Media</h2>
 
-            <label>
-              Image or video file
+            <label className="upload-picker">
+              <span>Choose media file</span>
+              <small>Images and videos are uploaded to S3 uploads/</small>
               <input
                 type="file"
                 accept="image/*,video/*"
@@ -1020,8 +1236,8 @@ function App() {
               </div>
             ) : (
               <p className="helper-text">
-                Choose an image or video file. After upload, wait a few seconds
-                before searching for the detected species tag.
+                Choose an image or video file. After upload, the middle panel will
+                show live backend processing information.
               </p>
             )}
 
@@ -1034,23 +1250,17 @@ function App() {
             </button>
 
             <p className="helper-text">
-              The file will be uploaded to S3 uploads/. Processing may take a few
-              seconds before it appears in search results.
+              The file is uploaded directly to S3 using Cognito Identity Pool
+              temporary AWS credentials.
             </p>
           </div>
 
-          <div className="workflow-card">
-            <h2>Permanent Ingestion Workflow</h2>
-            <ol className="workflow-list">
-              <li>User signs in through Cognito User Pool</li>
-              <li>User token is exchanged through Cognito Identity Pool</li>
-              <li>Authenticated role provides temporary S3 upload permission</li>
-              <li>Frontend uploads directly to S3 uploads/</li>
-              <li>S3 triggers the upload-handler Lambda</li>
-              <li>Oracle ML detects wildlife species</li>
-              <li>Metadata, tags, checksum, and URLs are saved into DynamoDB</li>
-              <li>Media becomes searchable in the UI</li>
-            </ol>
+          <div className="upload-status-column">
+            {renderUploadDetectionSummary()}
+          </div>
+
+          <div className="upload-summary-column">
+            {renderUploadSuccessCard()}
           </div>
         </div>
 
@@ -1058,22 +1268,17 @@ function App() {
           <summary>Developer Notes</summary>
           <div className="developer-note-body">
             <p>
-              This page is different from Search By Uploaded File. Search By
-              Uploaded File is a temporary query upload and does not permanently
-              store the query image.
+              Upload Media is permanent ingestion. It uploads the selected file to
+              S3 uploads/ using Cognito Identity Pool temporary AWS credentials.
             </p>
             <p>
-              Upload Media is permanent ingestion. It uploads the selected file to
-              S3 uploads/ using Cognito Identity Pool temporary AWS credentials,
-              then the existing S3-triggered Lambda runs checksum detection,
-              thumbnail generation, Oracle ML detection, SNS notification, and
-              DynamoDB insertion.
+              The S3-triggered Lambda then runs checksum duplicate detection,
+              thumbnail generation, Oracle ML detection, DynamoDB insertion, and
+              tag-based SNS notification.
             </p>
           </div>
         </details>
       </section>
-
-      {renderResponsePanel()}
     </>
   )
 
@@ -1783,6 +1988,46 @@ function formatFileSize(size) {
   }
 
   return `${(size / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function formatSpeciesDisplayName(value) {
+  return String(value || '')
+    .split('_')
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ')
+}
+
+function formatConfidence(value) {
+  const numeric = Number(value)
+
+  if (!Number.isFinite(numeric)) {
+    return String(value)
+  }
+
+  return `${(numeric * 100).toFixed(1)}%`
+}
+
+function getConfidenceChipClass(value) {
+  const numeric = Number(value)
+
+  if (!Number.isFinite(numeric)) {
+    return 'confidence-chip-unknown'
+  }
+
+  if (numeric >= 0.8) {
+    return 'confidence-chip-high'
+  }
+
+  if (numeric >= 0.5) {
+    return 'confidence-chip-medium'
+  }
+
+  return 'confidence-chip-low'
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function safeFileName(fileName) {
