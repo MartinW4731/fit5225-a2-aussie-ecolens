@@ -14,17 +14,15 @@ from io import BytesIO
 
 s3 = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
-table = dynamodb.Table("AussieEcoLensMedia")
 sns = boto3.client("sns")
 
-SNS_TOPIC_ARN = "arn:aws:sns:ap-southeast-2:656260749390:AussieEcoLensTagNotifications"
+# Main media metadata table
+media_table = dynamodb.Table("AussieEcoLensMedia")
 
-WATCHED_TAGS = [
-    "canis_familiaris",
-    "chalcophaps_longirostris",
-    "thylogale_stigmatica",
-    "Casuarius_casuarius"
-]
+# User notification preferences table
+subscriptions_table = dynamodb.Table("AussieEcoLensSubscriptions")
+
+SNS_TOPIC_ARN = "arn:aws:sns:ap-southeast-2:656260749390:AussieEcoLensTagNotifications"
 
 ORACLE_DETECT_URL = "http://169.224.229.232:8080/detect"
 ORACLE_VIDEO_DETECT_URL = "http://169.224.229.232:8080/detect-video"
@@ -33,6 +31,10 @@ ORACLE_ANNOTATE_URL = "http://169.224.229.232:8080/annotate"
 
 def calculate_sha256(file_bytes):
     return hashlib.sha256(file_bytes).hexdigest()
+
+
+def normalise_tag(tag):
+    return str(tag or "").strip().lower().replace(" ", "_")
 
 
 def create_thumbnail(bucket_name, object_key, file_name, image_bytes):
@@ -73,8 +75,8 @@ def generate_basic_tags(file_name):
         tags[word] = tags.get(word, 0) + 1
 
     tags["unknown"] = 1
-
     return tags
+
 
 def convert_floats_to_decimal(obj):
     if isinstance(obj, float):
@@ -186,6 +188,145 @@ def call_oracle_video_detector(file_name, file_type, video_bytes):
         return generate_basic_tags(file_name), {}, 0, "fallback_basic_tags"
 
 
+def get_all_subscriptions():
+    """
+    Read all user notification preferences from DynamoDB.
+    Handles pagination in case the table grows.
+    """
+    items = []
+    scan_kwargs = {}
+
+    while True:
+        response = subscriptions_table.scan(**scan_kwargs)
+        items.extend(response.get("Items", []))
+
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key:
+            break
+
+        scan_kwargs["ExclusiveStartKey"] = last_key
+
+    return items
+
+
+def get_matching_subscriptions(tags):
+    """
+    Match Oracle-detected species tags against user watched tags stored in DynamoDB.
+    """
+    try:
+        detected_tag_set = set(normalise_tag(tag) for tag in tags.keys())
+
+        print("Detected tag set for subscription matching:")
+        print(json.dumps(list(detected_tag_set), indent=2))
+
+        items = get_all_subscriptions()
+
+        matched_subscriptions = []
+
+        for item in items:
+            user_email = item.get("user_email")
+            subscribed_tags = item.get("subscribed_tags", [])
+
+            subscribed_tag_set = set(
+                normalise_tag(tag)
+                for tag in subscribed_tags
+                if normalise_tag(tag)
+            )
+
+            matched_tags = sorted(list(detected_tag_set.intersection(subscribed_tag_set)))
+
+            if user_email and matched_tags:
+                matched_subscriptions.append({
+                    "user_email": user_email,
+                    "matched_tags": matched_tags
+                })
+
+        print("Matched notification subscriptions:")
+        print(json.dumps(matched_subscriptions, indent=2, default=str))
+
+        return matched_subscriptions
+
+    except Exception as e:
+        print(f"Error reading notification subscriptions: {str(e)}")
+        return []
+
+
+def send_tag_notification(file_name, file_type, tags, confidence, file_url, thumbnail_url, frames_processed):
+    """
+    Send SNS notifications when detected tags match saved user tag preferences.
+
+    Important:
+    - DynamoDB stores user watched tags.
+    - SNS subscription filter policy controls which confirmed email receives the message.
+    - Each matched species tag is published as a separate SNS message with MessageAttributes.
+    """
+    matched_subscriptions = get_matching_subscriptions(tags)
+
+    if not matched_subscriptions:
+        print("No user subscribed tags matched. SNS notification not sent.")
+        return False
+
+    notification_results = []
+
+    for subscription in matched_subscriptions:
+        user_email = subscription.get("user_email")
+        matched_tags = subscription.get("matched_tags", [])
+
+        for matched_tag in matched_tags:
+            subject = f"AussieEcoLens Alert: {matched_tag}"
+
+            message = {
+                "message": "New media matched your watched wildlife tag.",
+                "matched_user_email": user_email,
+                "matched_tag": matched_tag,
+                "file_name": file_name,
+                "file_type": file_type,
+                "all_detected_tags": tags,
+                "confidence": confidence,
+                "frames_processed": frames_processed,
+                "file_url": file_url,
+                "thumbnail_url": thumbnail_url,
+                "note": "This notification was generated based on saved user tag preferences and delivered using SNS filter policy."
+            }
+
+            try:
+                response = sns.publish(
+                    TopicArn=SNS_TOPIC_ARN,
+                    Subject=subject,
+                    Message=json.dumps(message, indent=2, default=str),
+                    MessageAttributes={
+                        "species_tag": {
+                            "DataType": "String",
+                            "StringValue": matched_tag
+                        }
+                    }
+                )
+
+                print(f"SNS notification published for {user_email} with species_tag={matched_tag}")
+                print(json.dumps(response, indent=2, default=str))
+
+                notification_results.append({
+                    "user_email": user_email,
+                    "matched_tag": matched_tag,
+                    "status": "published_to_sns"
+                })
+
+            except Exception as e:
+                print(f"SNS notification failed for {user_email}, tag={matched_tag}: {str(e)}")
+
+                notification_results.append({
+                    "user_email": user_email,
+                    "matched_tag": matched_tag,
+                    "status": "failed",
+                    "error": str(e)
+                })
+
+    print("Notification results:")
+    print(json.dumps(notification_results, indent=2, default=str))
+
+    return any(result["status"] == "published_to_sns" for result in notification_results)
+
+
 def lambda_handler(event, context):
     print("Received event:")
     print(json.dumps(event, indent=2))
@@ -216,7 +357,7 @@ def lambda_handler(event, context):
         checksum = calculate_sha256(file_bytes)
         print(f"Checksum for {object_key}: {checksum}")
 
-        duplicate_check = table.scan(
+        duplicate_check = media_table.scan(
             FilterExpression=Attr("checksum").eq(checksum)
         )
 
@@ -238,7 +379,6 @@ def lambda_handler(event, context):
             continue
 
         file_id = str(uuid.uuid4())
-
         thumbnail_url = ""
 
         if file_type == "image":
@@ -273,13 +413,15 @@ def lambda_handler(event, context):
             tags = generate_basic_tags(file_name)
             ml_source = "fallback_basic_tags"
 
+        file_url = f"s3://{bucket_name}/{object_key}"
+
         item = {
             "file_id": file_id,
             "bucket": bucket_name,
             "s3_key": object_key,
             "file_name": file_name,
             "file_type": file_type,
-            "file_url": f"s3://{bucket_name}/{object_key}",
+            "file_url": file_url,
             "thumbnail_url": thumbnail_url,
             "tags": tags,
             "confidence": confidence,
@@ -291,7 +433,11 @@ def lambda_handler(event, context):
 
         item = convert_floats_to_decimal(item)
 
-        table.put_item(Item=item)
+        media_table.put_item(Item=item)
+
+        print("Inserted new item into DynamoDB:")
+        print(json.dumps(item, indent=2, default=str))
+
         notification_sent = send_tag_notification(
             file_name=file_name,
             file_type=file_type,
@@ -300,10 +446,7 @@ def lambda_handler(event, context):
             file_url=item.get("file_url"),
             thumbnail_url=item.get("thumbnail_url"),
             frames_processed=frames_processed
-        )   
-
-        print("Inserted new item into DynamoDB:")
-        print(json.dumps(item, indent=2, default=str))
+        )
 
         results.append({
             "file_name": file_name,
@@ -321,46 +464,7 @@ def lambda_handler(event, context):
     return {
         "statusCode": 200,
         "body": json.dumps({
-            "message": "S3 upload event processed with checksum deduplication, thumbnail generation, and Oracle ML detection",
+            "message": "S3 upload event processed with checksum deduplication, thumbnail generation, Oracle ML detection, DynamoDB metadata storage, user tag matching, and SNS filter-policy notification",
             "results": results
         }, default=str)
     }
-def send_tag_notification(file_name, file_type, tags, confidence, file_url, thumbnail_url, frames_processed):
-    matched_tags = []
-
-    for tag in WATCHED_TAGS:
-        if tag in tags:
-            matched_tags.append(tag)
-
-    if not matched_tags:
-        print("No watched tags found. SNS notification not sent.")
-        return False
-
-    subject = "AussieEcoLens Tag Notification"
-
-    message = {
-        "message": "New media matched watched wildlife tags.",
-        "matched_tags": matched_tags,
-        "file_name": file_name,
-        "file_type": file_type,
-        "tags": tags,
-        "confidence": confidence,
-        "frames_processed": frames_processed,
-        "file_url": file_url,
-        "thumbnail_url": thumbnail_url
-    }
-
-    try:
-        response = sns.publish(
-            TopicArn=SNS_TOPIC_ARN,
-            Subject=subject,
-            Message=json.dumps(message, indent=2, default=str)
-        )
-
-        print("SNS notification sent:")
-        print(json.dumps(response, indent=2, default=str))
-        return True
-
-    except Exception as e:
-        print(f"SNS notification failed: {str(e)}")
-        return Falsetable
