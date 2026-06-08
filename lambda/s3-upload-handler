@@ -15,10 +15,20 @@ from io import BytesIO
 s3 = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table("AussieEcoLensMedia")
+sns = boto3.client("sns")
 
-ORACLE_DETECT_URL = "http://158.179.17.163:8080/detect"
-ORACLE_VIDEO_DETECT_URL = "http://158.179.17.163:8080/detect-video"
-ORACLE_ANNOTATE_URL = "http://158.179.17.163:8080/annotate"
+SNS_TOPIC_ARN = "arn:aws:sns:ap-southeast-2:656260749390:AussieEcoLensTagNotifications"
+
+WATCHED_TAGS = [
+    "canis_familiaris",
+    "chalcophaps_longirostris",
+    "thylogale_stigmatica",
+    "Casuarius_casuarius"
+]
+
+ORACLE_DETECT_URL = "http://169.224.229.232:8080/detect"
+ORACLE_VIDEO_DETECT_URL = "http://169.224.229.232:8080/detect-video"
+ORACLE_ANNOTATE_URL = "http://169.224.229.232:8080/annotate"
 
 
 def calculate_sha256(file_bytes):
@@ -282,6 +292,15 @@ def lambda_handler(event, context):
         item = convert_floats_to_decimal(item)
 
         table.put_item(Item=item)
+        notification_sent = send_tag_notification(
+            file_name=file_name,
+            file_type=file_type,
+            tags=tags,
+            confidence=confidence,
+            file_url=item.get("file_url"),
+            thumbnail_url=item.get("thumbnail_url"),
+            frames_processed=frames_processed
+        )   
 
         print("Inserted new item into DynamoDB:")
         print(json.dumps(item, indent=2, default=str))
@@ -295,7 +314,8 @@ def lambda_handler(event, context):
             "tags": tags,
             "confidence": confidence,
             "frames_processed": frames_processed,
-            "ml_source": ml_source
+            "ml_source": ml_source,
+            "notification_sent": notification_sent
         })
 
     return {
@@ -305,3 +325,42 @@ def lambda_handler(event, context):
             "results": results
         }, default=str)
     }
+def send_tag_notification(file_name, file_type, tags, confidence, file_url, thumbnail_url, frames_processed):
+    matched_tags = []
+
+    for tag in WATCHED_TAGS:
+        if tag in tags:
+            matched_tags.append(tag)
+
+    if not matched_tags:
+        print("No watched tags found. SNS notification not sent.")
+        return False
+
+    subject = "AussieEcoLens Tag Notification"
+
+    message = {
+        "message": "New media matched watched wildlife tags.",
+        "matched_tags": matched_tags,
+        "file_name": file_name,
+        "file_type": file_type,
+        "tags": tags,
+        "confidence": confidence,
+        "frames_processed": frames_processed,
+        "file_url": file_url,
+        "thumbnail_url": thumbnail_url
+    }
+
+    try:
+        response = sns.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject=subject,
+            Message=json.dumps(message, indent=2, default=str)
+        )
+
+        print("SNS notification sent:")
+        print(json.dumps(response, indent=2, default=str))
+        return True
+
+    except Exception as e:
+        print(f"SNS notification failed: {str(e)}")
+        return Falsetable
