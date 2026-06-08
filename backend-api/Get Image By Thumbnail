@@ -4,11 +4,71 @@ from decimal import Decimal
 
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table("AussieEcoLensMedia")
+s3 = boto3.client("s3")
+
 
 def decimal_default(obj):
     if isinstance(obj, Decimal):
-        return int(obj)
+        if obj % 1 == 0:
+            return int(obj)
+        return float(obj)
     raise TypeError
+
+
+def convert_decimal(obj):
+    """
+    Convert DynamoDB Decimal values into normal int/float values
+    so the frontend can display clean JSON.
+    """
+    if isinstance(obj, list):
+        return [convert_decimal(value) for value in obj]
+
+    if isinstance(obj, dict):
+        return {key: convert_decimal(value) for key, value in obj.items()}
+
+    if isinstance(obj, Decimal):
+        if obj % 1 == 0:
+            return int(obj)
+        return float(obj)
+
+    return obj
+
+
+def parse_s3_url(s3_url):
+    if not s3_url or not s3_url.startswith("s3://"):
+        return None, None
+
+    without_scheme = s3_url.replace("s3://", "", 1)
+    parts = without_scheme.split("/", 1)
+
+    if len(parts) != 2:
+        return None, None
+
+    bucket = parts[0]
+    key = parts[1]
+
+    return bucket, key
+
+
+def generate_presigned_url(s3_url, expires_in=3600):
+    bucket, key = parse_s3_url(s3_url)
+
+    if not bucket or not key:
+        return None
+
+    try:
+        return s3.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={
+                "Bucket": bucket,
+                "Key": key
+            },
+            ExpiresIn=expires_in
+        )
+    except Exception as e:
+        print(f"Failed to generate presigned URL for {s3_url}: {str(e)}")
+        return None
+
 
 def lambda_handler(event, context):
     print("Received event:")
@@ -38,11 +98,17 @@ def lambda_handler(event, context):
         items = response.get("Items", [])
 
         while "LastEvaluatedKey" in response:
-            response = table.scan(ExclusiveStartKey=response["LastEvaluatedKey"])
+            response = table.scan(
+                ExclusiveStartKey=response["LastEvaluatedKey"]
+            )
             items.extend(response.get("Items", []))
 
         for item in items:
             if item.get("thumbnail_url") == thumbnail_url:
+                file_url = item.get("file_url")
+                file_type = item.get("file_type", "")
+                frames_processed = convert_decimal(item.get("frames_processed", 0))
+
                 return {
                     "statusCode": 200,
                     "headers": {
@@ -51,10 +117,15 @@ def lambda_handler(event, context):
                     },
                     "body": json.dumps({
                         "thumbnail_url": thumbnail_url,
-                        "file_url": item.get("file_url"),
+                        "file_url": file_url,
                         "file_name": item.get("file_name"),
-                        "file_type": item.get("file_type"),
-                        "tags": item.get("tags", {})
+                        "file_type": file_type,
+                        "tags": convert_decimal(item.get("tags", {})),
+                        "confidence": convert_decimal(item.get("confidence", {})),
+                        "frames_processed": int(frames_processed or 0),
+                        "ml_source": item.get("ml_source", ""),
+                        "file_presigned_url": generate_presigned_url(file_url),
+                        "thumbnail_presigned_url": generate_presigned_url(thumbnail_url)
                     }, default=decimal_default)
                 }
 
