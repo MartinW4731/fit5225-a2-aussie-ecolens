@@ -2208,3 +2208,83 @@ pre {
     padding: 0;
   }
 }
+
+
+/* Notification Settings */
+.notification-settings-card {
+  width: min(100%, 780px);
+  max-width: 780px;
+}
+
+.notification-add-row {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+}
+
+.notification-add-row button {
+  min-height: 44px;
+  padding-inline: 22px;
+}
+
+.notification-tags-panel {
+  display: grid;
+  gap: 10px;
+  border: 1px solid rgba(45, 116, 82, 0.18);
+  border-radius: 14px;
+  padding: 14px;
+  background: rgba(232, 241, 231, 0.72);
+}
+
+.notification-tags-panel strong {
+  color: var(--forest-900);
+  font-size: 14px;
+}
+
+.notification-tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.notification-tag-chip {
+  min-height: 34px;
+  border-color: rgba(201, 133, 66, 0.28);
+  padding: 8px 11px;
+  color: #74491f;
+  background: #f3dfbf;
+  font-size: 13px;
+}
+
+.notification-tag-chip:hover {
+  color: #fffaf0;
+  background: var(--warm);
+  border-color: var(--warm);
+}
+
+.notification-tag-chip span {
+  font-size: 16px;
+  line-height: 1;
+}
+
+.notification-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.notification-success-summary {
+  max-width: 780px;
+}
+
+@media (max-width: 780px) {
+  .notification-add-row {
+    grid-template-columns: 1fr;
+  }
+
+  .notification-add-row button,
+  .notification-actions button {
+    width: 100%;
+  }
+}
