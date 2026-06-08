@@ -4,29 +4,82 @@ from decimal import Decimal
 
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table("AussieEcoLensMedia")
+s3 = boto3.client("s3")
+
 
 def decimal_default(obj):
     if isinstance(obj, Decimal):
-        return int(obj)
+        if obj % 1 == 0:
+            return int(obj)
+        return float(obj)
     raise TypeError
+
+
+def convert_decimal(obj):
+    """
+    Convert DynamoDB Decimal values into normal int/float values
+    so the frontend can display clean JSON.
+    """
+    if isinstance(obj, list):
+        return [convert_decimal(value) for value in obj]
+
+    if isinstance(obj, dict):
+        return {key: convert_decimal(value) for key, value in obj.items()}
+
+    if isinstance(obj, Decimal):
+        if obj % 1 == 0:
+            return int(obj)
+        return float(obj)
+
+    return obj
+
+
+def parse_s3_url(s3_url):
+    if not s3_url or not s3_url.startswith("s3://"):
+        return None, None
+
+    without_scheme = s3_url.replace("s3://", "", 1)
+    parts = without_scheme.split("/", 1)
+
+    if len(parts) != 2:
+        return None, None
+
+    bucket = parts[0]
+    key = parts[1]
+
+    return bucket, key
+
+
+def generate_presigned_url(s3_url, expires_in=3600):
+    bucket, key = parse_s3_url(s3_url)
+
+    if not bucket or not key:
+        return None
+
+    try:
+        return s3.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={
+                "Bucket": bucket,
+                "Key": key
+            },
+            ExpiresIn=expires_in
+        )
+    except Exception as e:
+        print(f"Failed to generate presigned URL for {s3_url}: {str(e)}")
+        return None
+
 
 def lambda_handler(event, context):
     print("Received event:")
     print(json.dumps(event, indent=2))
 
     try:
-        # API Gateway sometimes sends body as a string
         if "body" in event and event["body"]:
             body = json.loads(event["body"])
         else:
             body = event
 
-        # Expected format:
-        # {
-        #   "tags": {
-        #     "casuarius": 1
-        #   }
-        # }
         required_tags = body.get("tags", {})
 
         if not required_tags:
@@ -44,34 +97,46 @@ def lambda_handler(event, context):
         response = table.scan()
         items = response.get("Items", [])
 
-        # Continue scanning if DynamoDB paginates results
         while "LastEvaluatedKey" in response:
-            response = table.scan(ExclusiveStartKey=response["LastEvaluatedKey"])
+            response = table.scan(
+                ExclusiveStartKey=response["LastEvaluatedKey"]
+            )
             items.extend(response.get("Items", []))
 
         matched_results = []
 
         for item in items:
-            item_tags = item.get("tags", {})
+            item_tags = convert_decimal(item.get("tags", {}))
+            required_tags_clean = convert_decimal(required_tags)
 
             matched = True
 
-            # Logical AND:
-            # every requested tag must exist and meet the minimum count
-            for tag, required_count in required_tags.items():
+            for tag, required_count in required_tags_clean.items():
                 actual_count = int(item_tags.get(tag, 0))
+
                 if actual_count < int(required_count):
                     matched = False
                     break
 
             if matched:
+                file_url = item.get("file_url")
+                thumbnail_url = item.get("thumbnail_url")
+
+                file_type = item.get("file_type", "")
+                frames_processed = convert_decimal(item.get("frames_processed", 0))
+
                 matched_results.append({
                     "file_id": item.get("file_id"),
                     "file_name": item.get("file_name"),
-                    "file_type": item.get("file_type"),
-                    "file_url": item.get("file_url"),
-                    "thumbnail_url": item.get("thumbnail_url"),
-                    "tags": item_tags
+                    "file_type": file_type,
+                    "file_url": file_url,
+                    "thumbnail_url": thumbnail_url,
+                    "file_presigned_url": generate_presigned_url(file_url),
+                    "thumbnail_presigned_url": generate_presigned_url(thumbnail_url),
+                    "tags": item_tags,
+                    "confidence": convert_decimal(item.get("confidence", {})),
+                    "frames_processed": int(frames_processed or 0),
+                    "ml_source": item.get("ml_source", "")
                 })
 
         return {
@@ -81,7 +146,7 @@ def lambda_handler(event, context):
                 "Access-Control-Allow-Origin": "*"
             },
             "body": json.dumps({
-                "query": required_tags,
+                "query": convert_decimal(required_tags),
                 "count": len(matched_results),
                 "results": matched_results
             }, default=decimal_default)
