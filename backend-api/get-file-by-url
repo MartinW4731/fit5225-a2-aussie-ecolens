@@ -1,0 +1,167 @@
+import json
+import boto3
+from decimal import Decimal
+from boto3.dynamodb.conditions import Attr
+
+dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table("AussieEcoLensMedia")
+s3 = boto3.client("s3")
+
+
+def decimal_default(obj):
+    if isinstance(obj, Decimal):
+        if obj % 1 == 0:
+            return int(obj)
+        return float(obj)
+    raise TypeError
+
+
+def convert_decimal(obj):
+    if isinstance(obj, list):
+        return [convert_decimal(value) for value in obj]
+
+    if isinstance(obj, dict):
+        return {key: convert_decimal(value) for key, value in obj.items()}
+
+    if isinstance(obj, Decimal):
+        if obj % 1 == 0:
+            return int(obj)
+        return float(obj)
+
+    return obj
+
+
+def parse_s3_url(s3_url):
+    if not s3_url or not s3_url.startswith("s3://"):
+        return None, None
+
+    without_scheme = s3_url.replace("s3://", "", 1)
+    parts = without_scheme.split("/", 1)
+
+    if len(parts) != 2:
+        return None, None
+
+    return parts[0], parts[1]
+
+
+def generate_presigned_url(s3_url, expires_in=3600):
+    bucket, key = parse_s3_url(s3_url)
+
+    if not bucket or not key:
+        return None
+
+    try:
+        return s3.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={
+                "Bucket": bucket,
+                "Key": key
+            },
+            ExpiresIn=expires_in
+        )
+    except Exception as e:
+        print(f"Failed to generate presigned URL for {s3_url}: {str(e)}")
+        return None
+
+
+def scan_all_matching_file_url(file_url):
+    response = table.scan(
+        FilterExpression=Attr("file_url").eq(file_url)
+    )
+    items = response.get("Items", [])
+
+    while "LastEvaluatedKey" in response:
+        response = table.scan(
+            FilterExpression=Attr("file_url").eq(file_url),
+            ExclusiveStartKey=response["LastEvaluatedKey"]
+        )
+        items.extend(response.get("Items", []))
+
+    return items
+
+
+def lambda_handler(event, context):
+    print("Received event:")
+    print(json.dumps(event, indent=2)[:2000])
+
+    try:
+        if "body" in event and event["body"]:
+            body = json.loads(event["body"])
+        else:
+            body = event
+
+        print("Parsed body:")
+        print(json.dumps(body, indent=2))
+
+        file_url = body.get("file_url", "").strip()
+
+        print("Looking for file_url:")
+        print(file_url)
+
+        if not file_url:
+            return response_json(400, {
+                "message": "Missing file_url.",
+                "found": False
+            })
+
+        items = scan_all_matching_file_url(file_url)
+
+        if not items:
+            print("No DynamoDB item found for file_url:")
+            print(file_url)
+
+            return response_json(200, {
+                "message": "File has not been processed yet.",
+                "found": False,
+                "file_url": file_url,
+                "processing_status": "pending"
+            })
+
+        item = items[0]
+        converted_item = convert_decimal(item)
+
+        print("DynamoDB item found:")
+        print(json.dumps(converted_item, indent=2, default=decimal_default))
+
+        result = {
+            "message": "File processing result found.",
+            "found": True,
+            "processing_status": "completed",
+            "file_id": item.get("file_id"),
+            "file_name": item.get("file_name"),
+            "file_type": item.get("file_type"),
+            "file_url": item.get("file_url"),
+            "thumbnail_url": item.get("thumbnail_url"),
+            "file_presigned_url": generate_presigned_url(item.get("file_url")),
+            "thumbnail_presigned_url": generate_presigned_url(item.get("thumbnail_url")),
+            "tags": convert_decimal(item.get("tags", {})),
+            "confidence": convert_decimal(item.get("confidence", {})),
+            "frames_processed": int(convert_decimal(item.get("frames_processed", 0)) or 0),
+            "ml_source": item.get("ml_source", ""),
+            "checksum": item.get("checksum", ""),
+            "created_at": item.get("created_at", "")
+        }
+
+        return response_json(200, result)
+
+    except Exception as e:
+        print("Error:", str(e))
+
+        return response_json(500, {
+            "message": "Failed to get file processing result.",
+            "found": False,
+            "error": str(e)
+        })
+
+
+def response_json(status_code, body):
+    return {
+        "statusCode": status_code,
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Content-Type,Authorization",
+            "Access-Control-Allow-Methods": "POST,OPTIONS"
+        },
+        "body": json.dumps(body, default=decimal_default)
+    }
