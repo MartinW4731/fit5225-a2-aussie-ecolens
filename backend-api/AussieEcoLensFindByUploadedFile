@@ -1,21 +1,38 @@
 import json
 import boto3
-import base64
 import urllib.request
+import urllib.error
 from decimal import Decimal
 
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table("AussieEcoLensMedia")
 s3 = boto3.client("s3")
 
-ORACLE_DETECT_URL = "http://158.179.17.163:8080/detect"
-ORACLE_VIDEO_DETECT_URL = "http://158.179.17.163:8080/detect-video"
+ORACLE_IMAGE_DETECT_URL = "http://169.224.229.232:8080/detect"
+ORACLE_VIDEO_DETECT_URL = "http://169.224.229.232:8080/detect-video"
 
 
 def decimal_default(obj):
     if isinstance(obj, Decimal):
-        return int(obj)
+        if obj % 1 == 0:
+            return int(obj)
+        return float(obj)
     raise TypeError
+
+
+def convert_decimal(obj):
+    if isinstance(obj, list):
+        return [convert_decimal(value) for value in obj]
+
+    if isinstance(obj, dict):
+        return {key: convert_decimal(value) for key, value in obj.items()}
+
+    if isinstance(obj, Decimal):
+        if obj % 1 == 0:
+            return int(obj)
+        return float(obj)
+
+    return obj
 
 
 def parse_s3_url(s3_url):
@@ -51,59 +68,60 @@ def generate_presigned_url(s3_url, expires_in=3600):
         return None
 
 
-def call_oracle_image_detector(file_name, file_type, image_base64):
-    payload = {
-        "file_name": file_name,
-        "file_type": file_type,
-        "image_base64": image_base64
-    }
-
-    data = json.dumps(payload).encode("utf-8")
+def post_json_to_oracle(url, payload, timeout=180):
+    body = json.dumps(payload).encode("utf-8")
 
     request = urllib.request.Request(
-        ORACLE_DETECT_URL,
-        data=data,
-        headers={"Content-Type": "application/json"},
+        url=url,
+        data=body,
+        headers={
+            "Content-Type": "application/json"
+        },
         method="POST"
     )
 
-    with urllib.request.urlopen(request, timeout=90) as response:
-        response_body = response.read().decode("utf-8")
-        result = json.loads(response_body)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response_body = response.read().decode("utf-8")
+            return json.loads(response_body)
 
-    print("Oracle image ML response:")
-    print(json.dumps(result, indent=2))
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8")
+        raise Exception(f"Oracle HTTP error {e.code}: {error_body}")
 
-    return result
+    except urllib.error.URLError as e:
+        raise Exception(f"Oracle request failed: {str(e)}")
 
 
-def call_oracle_video_detector(file_name, file_type, video_base64):
-    payload = {
-        "file_name": file_name,
-        "file_type": file_type,
-        "video_base64": video_base64
-    }
+def call_oracle_image(image_base64, file_name):
+    print(f"Calling Oracle image ML endpoint: {ORACLE_IMAGE_DETECT_URL}")
+    print(f"Sending query image base64 to Oracle: {file_name}")
 
-    data = json.dumps(payload).encode("utf-8")
+    return post_json_to_oracle(
+        ORACLE_IMAGE_DETECT_URL,
+        {
+            "file_name": file_name,
+            "image_base64": image_base64
+        },
+        timeout=120
+    )
 
-    request = urllib.request.Request(
+
+def call_oracle_video(video_base64, file_name):
+    print(f"Calling Oracle video ML endpoint: {ORACLE_VIDEO_DETECT_URL}")
+    print(f"Sending query video base64 to Oracle: {file_name}")
+
+    return post_json_to_oracle(
         ORACLE_VIDEO_DETECT_URL,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST"
+        {
+            "file_name": file_name,
+            "video_base64": video_base64
+        },
+        timeout=180
     )
 
-    with urllib.request.urlopen(request, timeout=180) as response:
-        response_body = response.read().decode("utf-8")
-        result = json.loads(response_body)
 
-    print("Oracle video ML response:")
-    print(json.dumps(result, indent=2))
-
-    return result
-
-
-def search_matching_items(required_tags):
+def scan_matching_media(detected_tags):
     response = table.scan()
     items = response.get("Items", [])
 
@@ -116,20 +134,19 @@ def search_matching_items(required_tags):
     matched_results = []
 
     for item in items:
-        item_tags = item.get("tags", {})
-        matched = True
+        item_tags = convert_decimal(item.get("tags", {}))
 
-        # Logical AND: every detected tag must exist in the stored item.
-        # We use minimum count 1 for uploaded-file matching.
-        for tag in required_tags.keys():
-            actual_count = int(item_tags.get(tag, 0))
-            if actual_count < 1:
-                matched = False
+        matched = False
+
+        for tag in detected_tags.keys():
+            if int(item_tags.get(tag, 0)) > 0:
+                matched = True
                 break
 
         if matched:
             file_url = item.get("file_url")
             thumbnail_url = item.get("thumbnail_url")
+            frames_processed = convert_decimal(item.get("frames_processed", 0))
 
             matched_results.append({
                 "file_id": item.get("file_id"),
@@ -140,8 +157,8 @@ def search_matching_items(required_tags):
                 "file_presigned_url": generate_presigned_url(file_url),
                 "thumbnail_presigned_url": generate_presigned_url(thumbnail_url),
                 "tags": item_tags,
-                "confidence": item.get("confidence", {}),
-                "frames_processed": item.get("frames_processed", 0),
+                "confidence": convert_decimal(item.get("confidence", {})),
+                "frames_processed": int(frames_processed or 0),
                 "ml_source": item.get("ml_source", "")
             })
 
@@ -150,7 +167,7 @@ def search_matching_items(required_tags):
 
 def lambda_handler(event, context):
     print("Received event:")
-    print(json.dumps(event, indent=2))
+    print(json.dumps(event, indent=2)[:2000])
 
     try:
         if "body" in event and event["body"]:
@@ -158,118 +175,87 @@ def lambda_handler(event, context):
         else:
             body = event
 
-        file_name = body.get("file_name", "uploaded_query_file")
-        file_type = body.get("file_type", "image").lower()
+        file_name = body.get("file_name", "query-file")
+        file_type = body.get("file_type", "image")
 
         if file_type == "image":
             image_base64 = body.get("image_base64")
 
             if not image_base64:
-                return {
-                    "statusCode": 400,
-                    "headers": {
-                        "Content-Type": "application/json",
-                        "Access-Control-Allow-Origin": "*"
-                    },
-                    "body": json.dumps({
-                        "message": "Missing image_base64 for uploaded image query."
-                    })
-                }
+                return response_json(400, {
+                    "message": "Missing image_base64 for image query."
+                })
 
-            oracle_result = call_oracle_image_detector(
-                file_name,
-                file_type,
-                image_base64
-            )
+            oracle_result = call_oracle_image(image_base64, file_name)
 
         elif file_type == "video":
             video_base64 = body.get("video_base64")
 
             if not video_base64:
-                return {
-                    "statusCode": 400,
-                    "headers": {
-                        "Content-Type": "application/json",
-                        "Access-Control-Allow-Origin": "*"
-                    },
-                    "body": json.dumps({
-                        "message": "Missing video_base64 for uploaded video query."
-                    })
-                }
+                return response_json(400, {
+                    "message": "Missing video_base64 for video query."
+                })
 
-            oracle_result = call_oracle_video_detector(
-                file_name,
-                file_type,
-                video_base64
-            )
+            oracle_result = call_oracle_video(video_base64, file_name)
 
         else:
-            return {
-                "statusCode": 400,
-                "headers": {
-                    "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*"
-                },
-                "body": json.dumps({
-                    "message": "Unsupported file_type. Please use image or video."
-                })
-            }
+            return response_json(400, {
+                "message": "Unsupported file_type. Use image or video.",
+                "file_type": file_type
+            })
 
-        detected_tags = oracle_result.get("tags", {})
-        confidence = oracle_result.get("confidence", {})
-        frames_processed = oracle_result.get("frames_processed", 0)
+        print("Oracle ML response:")
+        print(json.dumps(oracle_result, indent=2, default=decimal_default))
+
+        detected_tags = convert_decimal(oracle_result.get("tags", {}))
+        confidence = convert_decimal(oracle_result.get("confidence", {}))
+        frames_processed = convert_decimal(oracle_result.get("frames_processed", 0))
         source = oracle_result.get("source", "Oracle ML detection")
 
         if not detected_tags:
-            return {
-                "statusCode": 200,
-                "headers": {
-                    "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*"
-                },
-                "body": json.dumps({
-                    "message": "No tags detected from uploaded file.",
-                    "detected_tags": {},
-                    "confidence": confidence,
-                    "frames_processed": frames_processed,
-                    "source": source,
-                    "count": 0,
-                    "results": []
-                }, default=str)
-            }
-
-        matched_results = search_matching_items(detected_tags)
-
-        return {
-            "statusCode": 200,
-            "headers": {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*"
-            },
-            "body": json.dumps({
-                "message": "Uploaded file detected and matching media returned.",
+            return response_json(200, {
+                "message": "Uploaded query file processed, but no species tags were detected.",
                 "uploaded_file_name": file_name,
                 "uploaded_file_type": file_type,
-                "detected_tags": detected_tags,
+                "detected_tags": {},
                 "confidence": confidence,
-                "frames_processed": frames_processed,
+                "frames_processed": int(frames_processed or 0),
                 "source": source,
-                "count": len(matched_results),
-                "results": matched_results
-            }, default=str)
-        }
+                "count": 0,
+                "results": []
+            })
+
+        matched_results = scan_matching_media(detected_tags)
+
+        return response_json(200, {
+            "message": "Uploaded file detected and matching media returned.",
+            "uploaded_file_name": file_name,
+            "uploaded_file_type": file_type,
+            "detected_tags": detected_tags,
+            "confidence": confidence,
+            "frames_processed": int(frames_processed or 0),
+            "source": source,
+            "count": len(matched_results),
+            "results": matched_results
+        })
 
     except Exception as e:
         print("Error:", str(e))
 
-        return {
-            "statusCode": 500,
-            "headers": {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*"
-            },
-            "body": json.dumps({
-                "message": "Find by uploaded file failed.",
-                "error": str(e)
-            })
-        }
+        return response_json(500, {
+            "message": "Uploaded file search failed.",
+            "error": str(e)
+        })
+
+
+def response_json(status_code, body):
+    return {
+        "statusCode": status_code,
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Content-Type,Authorization",
+            "Access-Control-Allow-Methods": "POST,OPTIONS"
+        },
+        "body": json.dumps(body, default=decimal_default)
+    }
